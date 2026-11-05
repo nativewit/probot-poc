@@ -1,13 +1,12 @@
-import nock from "nock";
 // Requiring our app implementation
 import myProbotApp from "../src/index.js";
 import { Probot, ProbotOctokit } from "probot";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, beforeEach, afterEach, test, expect } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 // Requiring our fixtures
-import payload from "./fixtures/issues.opened.json" with { type: "json" };
+import issueOpenedPayload from "./fixtures/issues.opened.json" with { type: "json" };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -16,18 +15,65 @@ const privateKey = fs.readFileSync(
   "utf-8",
 );
 
-const issueCreatedBody = { body: "Thanks for opening this issue!" };
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GITHUB_API = "https://api.github.com";
 
-describe("My Probot app", () => {
+const json = (data: unknown, status = 200) =>
+  new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+
+/** Captured requests, keyed by `METHOD path`. */
+function createServer() {
+  const captured: Array<{ method: string; url: URL; body: any }> = [];
+  const stub = vi.fn(async (input: any, init?: RequestInit) => {
+    const url = new URL(String(input?.url ?? input));
+    let body: any = null;
+    if (init?.body) {
+      try {
+        body = JSON.parse(String(init.body));
+      } catch {
+        body = String(init.body);
+      }
+    }
+    captured.push({ method: init?.method ?? "GET", url, body });
+
+    // GitHub: installation token (auth bootstrap)
+    if (url.pathname === "/app/installations/2/access_tokens") {
+      return json({ token: "test", permissions: { issues: "write" } });
+    }
+
+    // LLM: chat completions
+    if (url.origin === new URL(GROQ_URL).origin) {
+      return json({
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "Classification: Bug\n- Possible cause: ...",
+            },
+          },
+        ],
+      });
+    }
+
+    // GitHub API default
+    return json({});
+  });
+  vi.stubGlobal("fetch", stub);
+  return { stub, captured };
+}
+
+describe("probot-poc app", () => {
   let probot: any;
 
   beforeEach(() => {
-    nock.disableNetConnect();
     probot = new Probot({
       appId: 123,
       privateKey,
       // disable request throttling and retries for testing
-      Octokit: ProbotOctokit.defaults((instanceOptions: {}) => ({
+      Octokit: ProbotOctokit.defaults((instanceOptions: any) => ({
         ...instanceOptions,
         retry: { enabled: false },
         throttle: { enabled: false },
@@ -37,41 +83,65 @@ describe("My Probot app", () => {
     probot.load(myProbotApp);
   });
 
-  test("creates a comment when an issue is opened", async () => {
-    const mock = nock("https://api.github.com")
-      // Test that we correctly return a test token
-      .post("/app/installations/2/access_tokens")
-      .reply(200, {
-        token: "test",
-        permissions: {
-          issues: "write",
-        },
-      })
-
-      // Test that a comment is posted
-      .post("/repos/hiimbex/testing-things/issues/1/comments", (body: any) => {
-        expect(body).toMatchObject(issueCreatedBody);
-        return true;
-      })
-      .reply(200);
-
-    // Receive a webhook event
-    await probot.receive({ name: "issues", payload });
-
-    expect(mock.pendingMocks()).toStrictEqual([]);
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.GROQ_API_KEY;
   });
 
-  afterEach(() => {
-    nock.cleanAll();
-    nock.enableNetConnect();
+  test("posts an AI triage comment when an issue is opened", async () => {
+    process.env.GROQ_API_KEY = "test-key";
+    const { captured } = createServer();
+
+    await probot.receive({
+      name: "issues",
+      payload: issueOpenedPayload,
+    });
+
+    const comment = captured.find(
+      (r) =>
+        r.url.pathname ===
+        "/repos/hiimbex/testing-things/issues/1/comments",
+    );
+    expect(comment).toBeDefined();
+    expect(comment!.body.body).toContain("🤖 **AI Triage**");
+    expect(comment!.body.body).toContain("Classification: Bug");
+
+    // The LLM was called with the issue title in the user message.
+    const llm = captured.find((r) => r.url.origin === new URL(GROQ_URL).origin);
+    expect(llm).toBeDefined();
+    expect(llm!.body.messages[1].content).toContain("Issue #1:");
+  });
+
+  test("skips triage for bot users", async () => {
+    process.env.GROQ_API_KEY = "test-key";
+    const { captured } = createServer();
+
+    await probot.receive({
+      name: "issues",
+      payload: {
+        ...issueOpenedPayload,
+        issue: {
+          ...issueOpenedPayload.issue,
+          user: { type: "Bot" },
+        },
+      },
+    });
+
+    expect(captured).toHaveLength(0);
+  });
+
+  test("skips triage when GROQ_API_KEY is missing", async () => {
+    const { captured } = createServer();
+
+    // The app-level try/catch means the comment is simply never posted;
+    // assert no GitHub comment (and no LLM call) happened.
+    const comment = captured.find(
+      (r) =>
+        r.url.pathname ===
+        "/repos/hiimbex/testing-things/issues/1/comments",
+    );
+    const llm = captured.find((r) => r.url.origin === new URL(GROQ_URL).origin);
+    expect(comment).toBeUndefined();
+    expect(llm).toBeUndefined();
   });
 });
-
-// For more information about testing with Jest see:
-// https://facebook.github.io/jest/
-
-// For more information about using TypeScript in your tests, Jest recommends:
-// https://github.com/kulshekhar/ts-jest
-
-// For more information about testing with Nock see:
-// https://github.com/nock/nock

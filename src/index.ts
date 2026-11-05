@@ -1,12 +1,12 @@
 import { Probot } from "probot";
-import { reviewPullRequest } from "./review.js";
-import { triageIssue } from "./triage.js";
+import { handleIssuesOpened } from "./controllers/issue.controller.js";
+import { handlePullRequest } from "./controllers/pull-request.controller.js";
 
 export default (app: Probot) => {
   // AI triage: comment possible solutions/opinions on new issues.
   app.on("issues.opened", async (context) => {
     try {
-      await triageIssue(context);
+      await handleIssuesOpened(context);
     } catch (error) {
       context.log.error(error, "AI issue triage failed");
     }
@@ -17,7 +17,7 @@ export default (app: Probot) => {
     ["pull_request.opened", "pull_request.synchronize"],
     async (context) => {
       try {
-        await reviewPullRequest(context);
+        await handlePullRequest(context);
       } catch (error) {
         context.log.error(error, "AI PR review failed");
       }

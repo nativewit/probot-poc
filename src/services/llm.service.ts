@@ -1,18 +1,15 @@
 /**
- * Minimal Groq client (OpenAI-compatible chat completions API).
+ * LLM service — minimal Groq client (OpenAI-compatible chat completions API).
  * Uses Node's built-in fetch, so no extra dependency is required.
  */
 
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+import type { ChatMessage, ChatOptions } from "../models/chat.js";
 
-export interface ChatMessage {
-  role: "system" | "user";
-  content: string;
-}
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 export async function chat(
   messages: ChatMessage[],
-  opts: { model?: string; maxTokens?: number; temperature?: number } = {},
+  opts: ChatOptions = {},
 ): Promise<string> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
