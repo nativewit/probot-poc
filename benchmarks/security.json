@@ -1,0 +1,47 @@
+{
+  "id": "security",
+  "name": "Security vulnerabilities",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "id": "hardcoded-secret",
+      "name": "Hardcoded credential in diff",
+      "files": [
+        {
+          "path": "src/config/stripe.ts",
+          "content": "export const stripeKey = \"sk_live_51H8xQexampleexample\";\nexport const stripeEnv = \"live\";\n"
+        }
+      ],
+      "diff": "diff --git a/src/config/stripe.ts b/src/config/stripe.ts\n@@ -1,1 +1,1 @@\n+export const stripeKey = \"sk_live_51H8xQexampleexample\";\n+export const stripeEnv = \"live\";\n",
+      "changedFiles": [{ "path": "src/config/stripe.ts", "status": "added" }],
+      "expectedFindings": [
+        {
+          "category": "security",
+          "severity": "critical",
+          "file": "src/config/stripe.ts",
+          "line": 1
+        }
+      ]
+    },
+    {
+      "id": "sql-injection-concat",
+      "name": "SQL built by string concatenation",
+      "files": [
+        {
+          "path": "src/db/user-queries.ts",
+          "content": "import { pool } from \"./pool.js\";\n\nexport async function findUser(email: string) {\n  const rows = await pool.query(`SELECT * FROM users WHERE email = '${email}'`);\n  return rows[0];\n}\n"
+        }
+      ],
+      "diff": "diff --git a/src/db/user-queries.ts b/src/db/user-queries.ts\n@@ -4,1 +4,1 @@\n-  const rows = await pool.query(\"SELECT * FROM users WHERE email = $1\", [email]);\n+  const rows = await pool.query(`SELECT * FROM users WHERE email = '${email}'`);\n",
+      "changedFiles": [{ "path": "src/db/user-queries.ts", "status": "modified" }],
+      "expectedFindings": [
+        {
+          "category": "security",
+          "severity": "critical",
+          "file": "src/db/user-queries.ts",
+          "line": 5
+        }
+      ]
+    }
+  ]
+}

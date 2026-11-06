@@ -1,0 +1,27 @@
+{
+  "id": "regressions",
+  "name": "Behavioral regressions",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "id": "dropped-validation",
+      "name": "Input validation silently removed",
+      "files": [
+        {
+          "path": "src/api/orders.ts",
+          "content": "export async function createOrder(req: { quantity: number }) {\n  if (req.quantity <= 0) {\n    throw new Error(\"quantity must be positive\");\n  }\n  return { quantity: req.quantity };\n}\n"
+        }
+      ],
+      "diff": "diff --git a/src/api/orders.ts b/src/api/orders.ts\n@@ -2,2 +2,0 @@\n-  if (req.quantity <= 0) {\n-    throw new Error(\"quantity must be positive\");\n-  }\n",
+      "changedFiles": [{ "path": "src/api/orders.ts", "status": "modified" }],
+      "expectedFindings": [
+        {
+          "category": "regression",
+          "severity": "high",
+          "file": "src/api/orders.ts",
+          "line": 1
+        }
+      ]
+    }
+  ]
+}

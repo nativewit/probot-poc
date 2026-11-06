@@ -1,0 +1,27 @@
+{
+  "id": "performance",
+  "name": "Performance anti-patterns",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "id": "n-plus-one-query",
+      "name": "Query issued inside a loop",
+      "files": [
+        {
+          "path": "src/reports/loader.ts",
+          "content": "import { pool } from \"../db/pool.js\";\n\nexport async function loadReports(orderIds: number[]) {\n  const reports = [];\n  for (const id of orderIds) {\n    const rows = await pool.query(\"SELECT * FROM reports WHERE order_id = $1\", [id]);\n    reports.push(...rows);\n  }\n  return reports;\n}\n"
+        }
+      ],
+      "diff": "diff --git a/src/reports/loader.ts b/src/reports/loader.ts\n@@ -5,1 +5,1 @@\n+    const rows = await pool.query(\"SELECT * FROM reports WHERE order_id = $1\", [id]);\n",
+      "changedFiles": [{ "path": "src/reports/loader.ts", "status": "modified" }],
+      "expectedFindings": [
+        {
+          "category": "performance",
+          "severity": "medium",
+          "file": "src/reports/loader.ts",
+          "line": 6
+        }
+      ]
+    }
+  ]
+}

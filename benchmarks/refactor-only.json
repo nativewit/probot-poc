@@ -1,0 +1,21 @@
+{
+  "id": "refactor-only",
+  "name": "Behavior-preserving refactor (clean)",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "id": "extract-constant",
+      "name": "Magic number extracted to a named constant",
+      "files": [
+        {
+          "path": "src/pricing/tax.ts",
+          "content": "const VAT_RATE = 0.2;\n\nexport function withVat(net: number): number {\n  return net * (1 + VAT_RATE);\n}\n"
+        }
+      ],
+      "diff": "diff --git a/src/pricing/tax.ts b/src/pricing/tax.ts\n@@ -1,1 +1,1 @@\n-  return net * 1.2;\n+  return net * (1 + VAT_RATE);\n",
+      "changedFiles": [{ "path": "src/pricing/tax.ts", "status": "modified" }],
+      "expectedFindings": [],
+      "expectClean": true
+    }
+  ]
+}

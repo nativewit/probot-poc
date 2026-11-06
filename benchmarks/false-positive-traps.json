@@ -1,0 +1,36 @@
+{
+  "id": "false-positive-traps",
+  "name": "Plausible-but-safe code (no inline findings expected)",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "id": "test-harness-secret",
+      "name": "Dummy credential in a unit test",
+      "description": "Fake API keys in test fixtures are standard practice — flagging them is a false positive.",
+      "files": [
+        {
+          "path": "test/auth.test.ts",
+          "content": "const fakeApiKey = \"sk_test_NOT_A_REAL_KEY\";\n\nit(\"rejects bad keys\", () => {\n  expect(checkKey(fakeApiKey)).toBe(false);\n});\n"
+        }
+      ],
+      "diff": "diff --git a/test/auth.test.ts b/test/auth.test.ts\n@@ -1,1 +1,1 @@\n+const fakeApiKey = \"sk_test_NOT_A_REAL_KEY\";\n",
+      "changedFiles": [{ "path": "test/auth.test.ts", "status": "added" }],
+      "expectedFindings": [],
+      "expectClean": true
+    },
+    {
+      "id": "documented-todo",
+      "name": "TODO comment with a tracking issue",
+      "files": [
+        {
+          "path": "src/cache/evictor.ts",
+          "content": "// TODO(#1421): switch to LRU once the eviction story is settled.\nexport function evict(cache: Map<string, string>): void {\n  cache.clear();\n}\n"
+        }
+      ],
+      "diff": "diff --git a/src/cache/evictor.ts b/src/cache/evictor.ts\n@@ -1,1 +1,1 @@\n+// TODO(#1421): switch to LRU once the eviction story is settled.\n",
+      "changedFiles": [{ "path": "src/cache/evictor.ts", "status": "added" }],
+      "expectedFindings": [],
+      "expectClean": true
+    }
+  ]
+}

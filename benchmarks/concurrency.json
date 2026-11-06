@@ -1,0 +1,27 @@
+{
+  "id": "concurrency",
+  "name": "Concurrency hazards",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "id": "check-then-act-race",
+      "name": "Check-then-act race without lock",
+      "files": [
+        {
+          "path": "src/jobs/scheduler.ts",
+          "content": "const running = new Map<string, Promise<void>>();\n\nexport function enqueue(name: string, task: () => Promise<void>): void {\n  if (running.has(name)) {\n    return;\n  }\n  running.set(name, task().finally(() => running.delete(name)));\n}\n"
+        }
+      ],
+      "diff": "diff --git a/src/jobs/scheduler.ts b/src/jobs/scheduler.ts\n@@ -4,2 +4,2 @@\n-  if (running.has(name)) {\n-    return;\n-  }\n+  if (!running.has(name)) {\n+    running.set(name, task().finally(() => running.delete(name)));\n+  }\n",
+      "changedFiles": [{ "path": "src/jobs/scheduler.ts", "status": "modified" }],
+      "expectedFindings": [
+        {
+          "category": "concurrency",
+          "severity": "medium",
+          "file": "src/jobs/scheduler.ts",
+          "line": 5
+        }
+      ]
+    }
+  ]
+}

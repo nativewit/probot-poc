@@ -1,0 +1,29 @@
+{
+  "id": "known-bugs",
+  "name": "Known bug classes",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "id": "null-deref-npe",
+      "name": "Null dereference on optional value",
+      "description": "Review must flag a null dereference on the changed line.",
+      "files": [
+        {
+          "path": "src/service/user-service.ts",
+          "content": "interface User { name?: string }\n\nexport function greet(user: User | null): string {\n  if (!user) {\n    throw new Error(\"missing user\");\n  }\n  return `hello ${user.name.trim()}`;\n}\n"
+        }
+      ],
+      "diff": "diff --git a/src/service/user-service.ts b/src/service/user-service.ts\n@@ -6,1 +6,1 @@\n-  return `hello ${user.name!.trim()}`;\n+  return `hello ${user.name.trim()}`;\n",
+      "changedFiles": [{ "path": "src/service/user-service.ts", "status": "modified" }],
+      "expectedFindings": [
+        {
+          "category": "functional",
+          "severity": "high",
+          "file": "src/service/user-service.ts",
+          "line": 7
+        }
+      ],
+      "expectClean": false
+    }
+  ]
+}
