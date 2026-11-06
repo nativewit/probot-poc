@@ -14,18 +14,38 @@
   "scripts": {
     "build": "tsc",
     "start": "probot run ./lib/index.js",
-    "test": "vitest"
+    "start:probot": "node lib/server.js",
+    "start:worker": "node lib/worker.js",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate deploy",
+    "db:migrate:dev": "prisma migrate dev",
+    "test": "vitest run",
+    "config:validate": "node lib/scripts/config-validate.js",
+    "eval:run": "node lib/scripts/eval-run.js",
+    "config:dry-run": "node lib/scripts/config-dry-run.js",
+    "model:smoke": "node lib/scripts/model-smoke.js",
+    "postinstall": "prisma skills sync || exit 0"
   },
   "dependencies": {
-    "probot": "^14.3.2"
+    "@opentelemetry/api": "^1.10.0",
+    "@prisma/client": "^6.19.3",
+    "bullmq": "^5.81.5",
+    "dotenv": "^18.0.9",
+    "ejs": "^7.0.2",
+    "ioredis": "^5.11.1",
+    "pino": "^10.4.0",
+    "probot": "^14.3.2",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@types/ejs": "^3.1.5",
     "@types/node": "^24.0.0",
-    "ioredis": "^5.10.1",
     "nock": "^14.0.5",
+    "pino-pretty": "^13.2.0",
+    "prisma": "^6.19.3",
     "smee-client": "^5.0.0",
-    "vitest": "^3.2.4",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^3.2.4"
   },
   "overrides": {
     "@types/pg": "8.15.1"

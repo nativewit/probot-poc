@@ -6,3 +6,17 @@ npm-debug.log
 coverage
 lib
 tsconfig.tsbuildinfo
+
+# Ignore Scratch
+.scratch
+
+.agents
+.claude
+.vscode
+.idea
+.cursor
+.devin
+
+# Production deployment secrets (ticket 13) — never commit
+deploy/.env
+deploy/secrets/*
