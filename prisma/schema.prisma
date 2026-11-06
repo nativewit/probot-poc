@@ -1,0 +1,525 @@
+// Prisma schema for the AI PR Reviewer.
+//
+// Ticket 01 established connectivity (Ping placeholder).
+// Ticket 03 adds the durable review-ingestion domain models:
+// installations, repositories, pull_requests, reviews, review_jobs,
+// review_state_transitions, outbox_events, webhook_deliveries.
+//
+// PostgreSQL is the source of truth; Redis/BullMQ is only execution state.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// GitHub App installation + repository registration (§13.1)
+// ---------------------------------------------------------------------------
+
+enum InstallationStatus {
+  active
+  deleted
+
+  @@map("installation_status")
+}
+
+model Installation {
+  id                  String             @id @default(cuid())
+  githubInstallationId BigInt            @unique @map("github_installation_id")
+  organization        String
+  status              InstallationStatus @default(active)
+  createdAt           DateTime           @default(now()) @map("created_at")
+  updatedAt           DateTime           @updatedAt @map("updated_at")
+
+  repositories Repository[]
+
+  @@map("installations")
+}
+
+enum RepositoryStatus {
+  active
+  disabled
+
+  @@map("repository_status")
+}
+
+model Repository {
+  id                 String          @id @default(cuid())
+  githubRepositoryId BigInt          @unique @map("github_repository_id")
+  installationId     String          @map("installation_id")
+  fullName           String          @unique @map("full_name")
+  defaultBranch      String?         @map("default_branch")
+  status             RepositoryStatus @default(active)
+  createdAt          DateTime        @default(now()) @map("created_at")
+  updatedAt          DateTime        @updatedAt @map("updated_at")
+
+  installation Installation  @relation(fields: [installationId], references: [id])
+  pullRequests PullRequest[]
+  findings     Finding[]
+
+  @@index([installationId])
+  @@map("repositories")
+}
+
+enum PullRequestStatus {
+  open
+  closed
+
+  @@map("pull_request_status")
+}
+
+model PullRequest {
+  id                 String            @id @default(cuid())
+  repositoryId       String            @map("repository_id")
+  githubPrNumber     Int               @map("github_pr_number")
+  headSha            String?           @map("head_sha")
+  baseSha            String?           @map("base_sha")
+  draft              Boolean           @default(false)
+  status             PullRequestStatus @default(open)
+  createdAt          DateTime          @default(now()) @map("created_at")
+  updatedAt          DateTime          @updatedAt @map("updated_at")
+
+  repository Repository @relation(fields: [repositoryId], references: [id])
+  reviews    Review[]
+
+  @@unique([repositoryId, githubPrNumber])
+  @@index([repositoryId])
+  @@map("pull_requests")
+}
+
+// ---------------------------------------------------------------------------
+// Reviews + jobs (§13.1, §4.3, §12.3)
+// ---------------------------------------------------------------------------
+
+enum ReviewState {
+  queued
+  preparing
+  cloning
+  analyzing
+  investigating
+  validating
+  publishing
+  completed
+  completed_with_warnings
+  failed
+  cancelled
+  superseded
+
+  @@map("review_state")
+}
+
+enum ReviewTrigger {
+  opened
+  synchronized
+  ready_for_review
+  manual
+
+  @@map("review_trigger")
+}
+
+model Review {
+  id                  String       @id @default(cuid())
+  pullRequestId       String       @map("pull_request_id")
+  githubInstallationId BigInt      @map("github_installation_id")
+  githubRepositoryId  BigInt       @map("github_repository_id")
+  pullRequestNumber   Int          @map("pull_request_number")
+  headSha             String       @map("head_sha")
+  baseSha             String?      @map("base_sha")
+  state               ReviewState  @default(queued)
+  trigger             ReviewTrigger
+  reviewMode          String       @default("standard") @map("review_mode")
+  // Immutable configuration snapshot identity (§11.5).
+  configurationHash   String?      @map("configuration_hash")
+  schemaVersion       Int?         @map("schema_version")
+  complexityScore     Int?         @map("complexity_score")
+  runtime             String?
+  provider            String?
+  model               String?
+  startedAt           DateTime?    @map("started_at")
+  completedAt         DateTime?    @map("completed_at")
+  errorCode           String?      @map("error_code")
+  errorMessage        String?      @map("error_message")
+  supersededByReviewId String?     @map("superseded_by_review_id")
+  supersededAt        DateTime?    @map("superseded_at")
+  createdAt           DateTime     @default(now()) @map("created_at")
+  updatedAt           DateTime     @updatedAt @map("updated_at")
+
+  pullRequest        PullRequest             @relation(fields: [pullRequestId], references: [id])
+  job                ReviewJob?
+  transitions        ReviewStateTransition[]
+  supersededByReview Review?                  @relation("ReviewSupersessions", fields: [supersededByReviewId], references: [id])
+  supersededReviews  Review[]                 @relation("ReviewSupersessions")
+  workspaces         ReviewWorkspace[]
+  findings           Finding[]
+  comments           ReviewComment[]
+
+  // Idempotency (§12.3): the same commit of the same PR is one review ever.
+  @@unique([pullRequestId, headSha, reviewMode])
+  @@index([pullRequestId, state])
+  @@index([githubInstallationId, githubRepositoryId, pullRequestNumber])
+  @@map("reviews")
+}
+
+enum JobStatus {
+  pending_outbox
+  enqueued
+  processing
+  completed
+  failed
+  superseded
+
+  @@map("job_status")
+}
+
+model ReviewJob {
+  id          String    @id @default(cuid())
+  reviewId    String    @unique @map("review_id")
+  // BullMQ job id (once successfully enqueued).
+  queueJobId  String?   @map("queue_job_id")
+  status      JobStatus @default(pending_outbox)
+  attempts    Int       @default(0)
+  lastError   String?   @map("last_error")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  review Review @relation(fields: [reviewId], references: [id])
+  outboxEvents OutboxEvent[]
+  webhookDeliveries WebhookDelivery[]
+
+  // Durable job identity (§12.3):
+  // installation_id + repository_id + pull_request_number + head_sha + review_mode
+  jobKey String @unique @map("job_key")
+
+  @@index([status])
+  @@map("review_jobs")
+}
+
+// Persisted state transitions (§4.3: "Each state transition should be
+// persisted").
+model ReviewStateTransition {
+  id        String      @id @default(cuid())
+  reviewId  String      @map("review_id")
+  fromState ReviewState? @map("from_state")
+  toState   ReviewState
+  createdAt DateTime    @default(now()) @map("created_at")
+
+  review Review @relation(fields: [reviewId], references: [id])
+
+  @@index([reviewId])
+  @@map("review_state_transitions")
+}
+
+// ---------------------------------------------------------------------------
+// Transactional outbox (§12.2) + webhook delivery idempotency
+// ---------------------------------------------------------------------------
+
+enum OutboxStatus {
+  pending
+  published
+  discarded
+
+  @@map("outbox_status")
+}
+
+model OutboxEvent {
+  id          String       @id @default(cuid())
+  reviewJobId String       @map("review_job_id")
+  type        String
+  payload     Json
+  status      OutboxStatus @default(pending)
+  attempts    Int          @default(0)
+  lastError   String?      @map("last_error")
+  publishedAt DateTime?    @map("published_at")
+  createdAt   DateTime     @default(now()) @map("created_at")
+
+  reviewJob ReviewJob @relation(fields: [reviewJobId], references: [id])
+
+  @@index([status, createdAt])
+  @@map("outbox_events")
+}
+
+model WebhookDelivery {
+  id          String   @id @default(cuid())
+  deliveryId  String   @unique @map("delivery_id")
+  event       String
+  action      String?
+  reviewJobId String?  @map("review_job_id")
+  processedAt DateTime @default(now()) @map("processed_at")
+
+  reviewJob ReviewJob? @relation(fields: [reviewJobId], references: [id])
+
+  @@index([deliveryId])
+  @@map("webhook_deliveries")
+}
+
+// ---------------------------------------------------------------------------
+// Review workspace (ticket 04 — Repository Review Workspace)
+// ---------------------------------------------------------------------------
+
+enum WorkspaceStatus {
+  active
+  cleaned
+  failed
+
+  @@map("workspace_status")
+}
+
+// ---------------------------------------------------------------------------
+// Findings (ticket 08 — Finding Verification and Lifecycle, §7, §13.1)
+// ---------------------------------------------------------------------------
+
+// §7.2 lifecycle statuses. One Finding row per (repository, review,
+// fingerprint): each review re-records the findings it observed, and the
+// lifecycle status describes how the observation relates to history.
+enum FindingLifecycleStatus {
+  new
+  existing
+  updated
+  resolved
+  dismissed
+  uncertain
+  superseded
+
+  @@map("finding_lifecycle_status")
+}
+
+// Normalized review finding (§13.1). Fingerprints are deterministic
+// (repository + category + code location + normalized description + affected
+// code identity; never the line number alone, §7.3).
+model Finding {
+  id                    String                 @id @default(cuid())
+  reviewId              String                 @map("review_id")
+  repositoryId          String                 @map("repository_id")
+  fingerprint           String
+  category              String
+  severity              String
+  confidence            Float
+  title                 String
+  filePath              String                 @map("file_path")
+  lineNumber            Int                    @map("line_number")
+  description           String
+  // Retained evidence references (file, line, excerpt, reason).
+  evidence              Json
+  // Derived from thresholds and evidence anchoring — never trusted from the
+  // agent's self-reported fields.
+  verified              Boolean
+  status                FindingLifecycleStatus @default(new)
+  // Reintroduced after being resolved: points at the resolved occurrence.
+  reopenedFromFindingId String?                @map("reopened_from_finding_id")
+  // Set when this finding's review was superseded (ticket 03).
+  supersededByReviewId  String?                @map("superseded_by_review_id")
+  resolvedAt            DateTime?              @map("resolved_at")
+  lastSeenAt            DateTime               @default(now()) @map("last_seen_at")
+  createdAt             DateTime               @default(now()) @map("created_at")
+  updatedAt             DateTime               @updatedAt @map("updated_at")
+
+  review       Review                   @relation(fields: [reviewId], references: [id])
+  repository   Repository               @relation(fields: [repositoryId], references: [id])
+  reopenedFrom Finding?                 @relation("FindingReopens", fields: [reopenedFromFindingId], references: [id])
+  reopens      Finding[]                @relation("FindingReopens")
+  transitions  FindingStatusTransition[]
+  comments     ReviewComment[]
+
+  // One occurrence per fingerprint per review (in-review deduplication).
+  @@unique([repositoryId, reviewId, fingerprint])
+  @@index([repositoryId, fingerprint])
+  @@index([repositoryId, status])
+  @@index([reviewId])
+  @@map("findings")
+}
+
+// Persisted lifecycle transitions (§7.2). Every status change is recorded.
+model FindingStatusTransition {
+  id         String                 @id @default(cuid())
+  findingId  String                 @map("finding_id")
+  reviewId   String?                @map("review_id")
+  fromStatus FindingLifecycleStatus? @map("from_status")
+  toStatus   FindingLifecycleStatus
+  reason     String?
+  createdAt  DateTime               @default(now()) @map("created_at")
+
+  finding Finding @relation(fields: [findingId], references: [id])
+
+  @@index([findingId])
+  @@index([reviewId])
+  @@map("finding_status_transitions")
+}
+
+// ---------------------------------------------------------------------------
+// GitHub publication state (ticket 09 — GitHub Review Publishing, §7.4, §13.1)
+// ---------------------------------------------------------------------------
+
+enum ReviewCommentType {
+  summary
+  inline
+
+  @@map("review_comment_type")
+}
+
+enum ReviewCommentStatus {
+  published
+  failed
+  superseded
+
+  @@map("review_comment_status")
+}
+
+// GitHub comment publication state (§13.1). One row per published GitHub
+// comment: the summary review comment (commentType "summary", no finding) and
+// one row per inline review comment (commentType "inline", linked finding).
+// The GitHub comment ID enables deduplication and reconciliation across
+// repeated publications of the same review.
+model ReviewComment {
+  id              String              @id @default(cuid())
+  reviewId        String              @map("review_id")
+  findingId       String?             @map("finding_id")
+  // Deterministic finding fingerprint for reconciliation with comments
+  // created by an earlier publication attempt.
+  fingerprint     String?
+  githubCommentId BigInt?             @map("github_comment_id")
+  commentType     ReviewCommentType   @map("comment_type")
+  status          ReviewCommentStatus @default(published)
+  publishedAt     DateTime            @default(now()) @map("published_at")
+  createdAt       DateTime            @default(now()) @map("created_at")
+
+  review  Review   @relation(fields: [reviewId], references: [id])
+  finding Finding? @relation(fields: [findingId], references: [id])
+
+  @@index([reviewId])
+  @@index([findingId])
+  @@map("review_comments")
+}
+
+// ---------------------------------------------------------------------------
+// Admin audit log (ticket 10 — Admin Authentication & Config API, §13.1, §14.2)
+// ---------------------------------------------------------------------------
+
+// Administrative and security events: every admin login, every configuration
+// change (update/reload/rollback) and rejected attempts. Metadata is free-form
+// JSON (e.g. configuration hash, request origin) and must never contain
+// secrets.
+model AuditLog {
+  id        String   @id @default(cuid())
+  actor     String
+  action    String
+  resource  String
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Command execution audit (ticket 11 — Secure Execution and Resource Isolation)
+// ---------------------------------------------------------------------------
+
+// Every repository-controlled command request — allowed, denied, or failed —
+// is persisted here by the command policy engine, which validates commands
+// OUTSIDE the agent (§10.3). Command arguments are stored for auditability
+// (they are never interpolated into a shell). stdout/stderr CONTENT is never
+// persisted (it may embed untrusted repository data) — only sizes, exit codes
+// and outcome reasons.
+model CommandExecutionAudit {
+  id          String   @id @default(cuid())
+  reviewId    String?  @map("review_id")
+  actor       String
+  command     String
+  args        Json
+  // allowed | denied | error
+  decision    String
+  // Machine-readable reason code (e.g. "not_allowlisted", "tests_disabled").
+  reason      String?
+  mode        String
+  sandboxed   Boolean
+  networkMode String   @map("network_mode")
+  exitCode    Int?     @map("exit_code")
+  timedOut    Boolean  @default(false)
+  diskQuotaExceeded Boolean @default(false) @map("disk_quota_exceeded")
+  durationMs  Int?     @map("duration_ms")
+  stdoutBytes Int      @default(0) @map("stdout_bytes")
+  stderrBytes Int      @default(0) @map("stderr_bytes")
+  metadata    Json?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([reviewId])
+  @@index([decision])
+  @@index([createdAt])
+  @@map("command_execution_audits")
+}
+
+// ---------------------------------------------------------------------------
+// Quality evaluation (ticket 12 — Quality Evaluation Framework, §13.1, §19)
+// ---------------------------------------------------------------------------
+
+// One persisted benchmark run. Each run is keyed by the full evaluation
+// identity (model / provider / runtime / configuration hash / prompt version /
+// benchmark version) so quality trends are comparable across runs and
+// regressions are attributable to a change of exactly one of those inputs.
+// Scores are rational numbers in [0, 1]; latency is in milliseconds.
+// NEVER store repository content or API keys here — only metrics and counts.
+model EvaluationRun {
+  id                 String    @id @default(cuid())
+  benchmarkVersion   String    @map("benchmark_version")
+  benchmarkSuite     String    @map("benchmark_suite")
+  model              String
+  provider           String
+  runtime            String
+  configurationHash  String?   @map("configuration_hash")
+  promptVersion      String?   @map("prompt_version")
+
+  startedAt          DateTime  @default(now()) @map("started_at")
+  completedAt        DateTime? @map("completed_at")
+
+  totalCases         Int       @default(0) @map("total_cases")
+  passedCases        Int       @default(0) @map("passed_cases")
+  // Finding-level aggregates (§19.2).
+  truePositives      Int       @default(0) @map("true_positives")
+  falsePositives     Int       @default(0) @map("false_positives")
+  falseNegatives     Int       @default(0) @map("false_negatives")
+  precision          Float     @default(0)
+  recall             Float     @default(0)
+  severityAccuracy   Float     @default(0) @map("severity_accuracy")
+  lineAccuracy       Float     @default(0) @map("line_accuracy")
+  latencyP50Ms       Int?      @map("latency_p50_ms")
+  latencyP95Ms       Int?      @map("latency_p95_ms")
+  overallScore       Float     @default(0) @map("overall_score")
+  // Quality gate (§19.4): threshold applied and decision.
+  qualityThreshold   Float     @map("quality_threshold")
+  passed             Boolean   @default(false)
+  // Per-case detail (no secrets, no repository content).
+  details            Json?
+
+  createdAt          DateTime  @default(now()) @map("created_at")
+
+  @@index([benchmarkVersion, createdAt])
+  @@index([model, provider, createdAt])
+  @@map("evaluation_runs")
+}
+
+// Metadata for the temporary per-review workspace directory. Paths and SHAs
+// only — credentials are NEVER persisted here (§10.6).
+model ReviewWorkspace {
+  id           String          @id @default(cuid())
+  reviewId     String          @map("review_id")
+  path         String
+  headSha      String          @map("head_sha")
+  baseSha      String?         @map("base_sha")
+  mergeBaseSha String?         @map("merge_base_sha")
+  status       WorkspaceStatus @default(active)
+  lastError    String?         @map("last_error")
+  createdAt    DateTime        @default(now()) @map("created_at")
+  cleanedAt    DateTime?       @map("cleaned_at")
+
+  review Review @relation(fields: [reviewId], references: [id])
+
+  @@unique([reviewId, path])
+  @@index([status])
+  @@index([createdAt])
+  @@map("review_workspaces")
+}
