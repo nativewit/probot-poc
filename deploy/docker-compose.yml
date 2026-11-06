@@ -106,6 +106,12 @@ services:
     command: ["node", "lib/worker.js"]
     env_file:
       - ./.env
+    # Public resolvers: the host's local stub resolver (forwarded via the
+    # bridge gateway) is unreachable from inside the container, which caused
+    # getaddrinfo EAI_AGAIN for api.github.com during token minting.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       DATABASE_URL: postgres://reviewer:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/reviewer
       REDIS_URL: redis://redis:6379
