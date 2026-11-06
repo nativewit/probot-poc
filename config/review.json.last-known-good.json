@@ -1,0 +1,230 @@
+{
+  "schemaVersion": 1,
+  "application": {
+    "name": "ai-pr-reviewer",
+    "environment": "development",
+    "timezone": "UTC"
+  },
+  "github": {
+    "organization": "YOUR_ORGANIZATION",
+    "installationScope": "organization",
+    "events": [
+      "opened",
+      "synchronize",
+      "ready_for_review"
+    ],
+    "manualCommand": "/review",
+    "draftPullRequests": {
+      "enabled": false
+    },
+    "permissions": {
+      "readContents": true,
+      "readPullRequests": true,
+      "readChecks": true,
+      "writePullRequests": true,
+      "writeReviewComments": true
+    }
+  },
+  "review": {
+    "enabled": true,
+    "triggers": {
+      "automatic": true,
+      "manual": true
+    },
+    "strategy": {
+      "mode": "adaptive",
+      "maxStages": 4,
+      "verifyFindings": true
+    },
+    "categories": {
+      "functional": true,
+      "regression": true,
+      "security": true,
+      "performance": true,
+      "concurrency": true,
+      "dataIntegrity": true,
+      "errorHandling": true,
+      "apiCompatibility": true,
+      "maintainability": true,
+      "testing": true
+    },
+    "severity": [
+      "critical",
+      "high",
+      "medium",
+      "low",
+      "informational"
+    ],
+    "confidence": {
+      "minimumInline": 0.85,
+      "minimumVerified": 0.8
+    },
+    "findings": {
+      "deduplication": true,
+      "trackAcrossCommits": true,
+      "lifecycleManagement": true,
+      "publishUncertainInSummary": true
+    },
+    "reporting": {
+      "summary": true,
+      "inlineComments": true,
+      "publishCleanReview": true,
+      "publishApproval": false
+    },
+    "conventions": {
+      "detectAutomatically": true,
+      "customInstructions": ""
+    },
+    "complexity": {
+      "weights": {
+        "diffSize": 1,
+        "changedFiles": 1,
+        "structural": 1.5,
+        "dependencyImpact": 1,
+        "riskyCode": 2,
+        "concurrency": 1.5,
+        "dataIntegrity": 2
+      },
+      "thresholds": {
+        "low": 1.5,
+        "medium": 3.5
+      }
+    }
+  },
+  "agent": {
+    "runtime": {
+      "type": "opencode-cli",
+      "sessionStrategy": "per-review",
+      "timeoutMs": 900000
+    },
+    "context": {
+      "adaptive": true,
+      "maxFiles": 100,
+      "maxRetrievalCalls": 40,
+      "maxInputTokens": 60000,
+      "maxOutputTokens": 8192
+    },
+    "tools": {
+      "enabled": [
+        "read_file",
+        "search_code",
+        "list_files",
+        "inspect_symbols",
+        "get_diff"
+      ],
+      "permissionPolicy": "allowlist"
+    }
+  },
+  "provider": {
+    "type": "openai-compatible",
+    "baseURL": "https://llm.nativewit.app/compat",
+    "apiKeyEnv": "MODEL_API_KEY",
+    "model": "glm-4.7-flash",
+    "temperature": 0.1,
+    "maxOutputTokens": 8192,
+    "timeoutMs": 120000,
+    "failurePolicy": "fail-immediately"
+  },
+  "execution": {
+    "mode": "static-analysis",
+    "commands": {
+      "allowlist": [
+        "git",
+        "grep",
+        "find"
+      ],
+      "allowTests": false,
+      "allowBuilds": false,
+      "allowPackageScripts": false
+    },
+    "sandbox": {
+      "enabled": false,
+      "networkMode": "allowlist",
+      "allowedDomains": [],
+      "runAsNonRoot": true
+    },
+    "resources": {
+      "cpuLimit": "2",
+      "memoryLimit": "2Gi",
+      "diskLimit": "5Gi",
+      "executionTimeoutMs": 900000
+    }
+  },
+  "repository": {
+    "clone": {
+      "strategy": "shallow",
+      "depth": 1
+    },
+    "workspace": {
+      "retentionHours": 0,
+      "cleanupAfterReview": true
+    },
+    "files": {
+      "maxFileBytes": 1000000,
+      "maxFilesPerReview": 2000
+    }
+  },
+  "queue": {
+    "concurrency": 1,
+    "newCommitPolicy": "supersede",
+    "retry": {
+      "infrastructure": {
+        "enabled": true,
+        "maxAttempts": 3,
+        "backoff": "exponential"
+      },
+      "providerUnavailable": {
+        "enabled": false
+      }
+    }
+  },
+  "persistence": {
+    "reviewHistoryRetentionDays": 365,
+    "findingRetentionDays": 365,
+    "auditRetentionDays": 365,
+    "artifactRetentionDays": 30
+  },
+  "configuration": {
+    "reloadStrategy": "manual",
+    "repositoryOverrides": {
+      "enabled": true,
+      "allowedSections": [
+        "review.categories",
+        "review.severity",
+        "review.reporting",
+        "review.strategy"
+      ]
+    },
+    "validation": {
+      "strict": true,
+      "dryRun": true
+    },
+    "rollbackEnabled": true
+  },
+  "observability": {
+    "logs": {
+      "level": "info",
+      "format": "json"
+    },
+    "metrics": {
+      "enabled": true
+    },
+    "tracing": {
+      "enabled": true
+    },
+    "alerts": {
+      "reviewFailure": true,
+      "queueBacklog": true,
+      "providerUnavailable": true,
+      "resourceLimitExceeded": true
+    }
+  },
+  "evaluation": {
+    "enabled": true,
+    "benchmarkSuite": "default",
+    "trackFalsePositives": true,
+    "trackPrecision": true,
+    "trackReviewLatency": true,
+    "minimumQualityThreshold": 0.85
+  }
+}

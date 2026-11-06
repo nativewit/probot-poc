@@ -1,0 +1,369 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "review-config-v1.schema.json",
+  "title": "AI PR Reviewer configuration (review.json)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "provider", "github"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": {
+      "type": "integer",
+      "enum": [1],
+      "description": "Supported configuration schema versions. Unsupported versions are rejected."
+    },
+    "application": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "environment": { "enum": ["development", "test", "staging", "production"] },
+        "timezone": { "type": "string", "minLength": 1, "maxLength": 64 }
+      }
+    },
+    "github": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["organization"],
+      "properties": {
+        "organization": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "installationScope": { "enum": ["organization", "repository"] },
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["opened", "synchronize", "ready_for_review", "issue_comment"] }
+        },
+        "manualCommand": { "type": "string", "minLength": 2, "maxLength": 32 },
+        "draftPullRequests": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "enabled": { "type": "boolean" } }
+        },
+        "permissions": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "readContents": { "type": "boolean" },
+            "readPullRequests": { "type": "boolean" },
+            "readChecks": { "type": "boolean" },
+            "writePullRequests": { "type": "boolean" },
+            "writeReviewComments": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "triggers": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "automatic": { "type": "boolean" },
+            "manual": { "type": "boolean" }
+          }
+        },
+        "strategy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": { "enum": ["adaptive", "fixed"] },
+            "maxStages": { "type": "integer", "minimum": 1, "maximum": 8 },
+            "verifyFindings": { "type": "boolean" }
+          }
+        },
+        "categories": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "functional": { "type": "boolean" },
+            "regression": { "type": "boolean" },
+            "security": { "type": "boolean" },
+            "performance": { "type": "boolean" },
+            "concurrency": { "type": "boolean" },
+            "dataIntegrity": { "type": "boolean" },
+            "errorHandling": { "type": "boolean" },
+            "apiCompatibility": { "type": "boolean" },
+            "maintainability": { "type": "boolean" },
+            "testing": { "type": "boolean" }
+          }
+        },
+        "severity": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["critical", "high", "medium", "low", "informational"] }
+        },
+        "confidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "minimumInline": { "type": "number", "minimum": 0, "maximum": 1 },
+            "minimumVerified": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "findings": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "deduplication": { "type": "boolean" },
+            "trackAcrossCommits": { "type": "boolean" },
+            "lifecycleManagement": { "type": "boolean" },
+            "publishUncertainInSummary": { "type": "boolean" }
+          }
+        },
+        "reporting": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "summary": { "type": "boolean" },
+            "inlineComments": { "type": "boolean" },
+            "publishCleanReview": { "type": "boolean" },
+            "publishApproval": { "type": "boolean" }
+          }
+        },
+        "conventions": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "detectAutomatically": { "type": "boolean" },
+            "customInstructions": { "type": "string", "maxLength": 10000 }
+          }
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": { "enum": ["opencode-cli", "opencode-server", "custom"] },
+            "sessionStrategy": { "enum": ["per-review", "per-stage", "shared"] },
+            "timeoutMs": { "type": "integer", "minimum": 1000, "maximum": 3600000 }
+          }
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "adaptive": { "type": "boolean" },
+            "maxFiles": { "type": "integer", "minimum": 1, "maximum": 10000 },
+            "maxRetrievalCalls": { "type": "integer", "minimum": 1, "maximum": 1000 },
+            "maxInputTokens": { "type": "integer", "minimum": 1000, "maximum": 2000000 },
+            "maxOutputTokens": { "type": "integer", "minimum": 256, "maximum": 200000 }
+          }
+        },
+        "tools": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "array", "maxItems": 64, "items": { "type": "string", "minLength": 1, "maxLength": 64 } },
+            "permissionPolicy": { "enum": ["allowlist", "none"] }
+          }
+        }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseURL", "apiKeyEnv", "model"],
+      "properties": {
+        "type": { "enum": ["openai-compatible"] },
+        "baseURL": {
+          "type": "string",
+          "minLength": 1,
+          "description": "May reference environment variables: ${MODEL_BASE_URL} (required) or ${MODEL_BASE_URL:-default} (fallback)."
+        },
+        "apiKeyEnv": {
+          "type": "string",
+          "pattern": "^[A-Z_][A-Z0-9_]*$",
+          "description": "Name of the environment variable holding the API key. The key value itself must NEVER be stored in review.json."
+        },
+        "model": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "maxOutputTokens": { "type": "integer", "minimum": 256, "maximum": 200000 },
+        "timeoutMs": { "type": "integer", "minimum": 1000, "maximum": 600000 },
+        "failurePolicy": { "enum": ["fail-immediately", "retry-once"] }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "enum": ["read-only", "static-analysis", "sandbox"] },
+        "commands": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allowlist": { "type": "array", "maxItems": 64, "items": { "type": "string", "minLength": 1, "maxLength": 64 } },
+            "allowTests": { "type": "boolean" },
+            "allowBuilds": { "type": "boolean" },
+            "allowPackageScripts": { "type": "boolean" }
+          }
+        },
+        "sandbox": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "networkMode": { "enum": ["none", "allowlist", "open"] },
+            "allowedDomains": { "type": "array", "maxItems": 128, "items": { "type": "string", "minLength": 1, "maxLength": 253 } },
+            "runAsNonRoot": { "type": "boolean" }
+          }
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpuLimit": { "type": "string", "pattern": "^\\d+(\\.\\d+)?$" },
+            "memoryLimit": { "type": "string", "pattern": "^\\d+(Gi|Mi|G|M)$" },
+            "diskLimit": { "type": "string", "pattern": "^\\d+(Gi|Mi|G|M)$" },
+            "executionTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 3600000 }
+          }
+        }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "clone": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "strategy": { "enum": ["shallow", "full"] },
+            "depth": { "type": "integer", "minimum": 1, "maximum": 50 }
+          }
+        },
+        "workspace": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "retentionHours": { "type": "integer", "minimum": 0, "maximum": 8760 },
+            "cleanupAfterReview": { "type": "boolean" }
+          }
+        },
+        "files": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxFileBytes": { "type": "integer", "minimum": 0, "maximum": 50000000 },
+            "maxFilesPerReview": { "type": "integer", "minimum": 0, "maximum": 10000 }
+          }
+        }
+      }
+    },
+    "queue": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "concurrency": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "newCommitPolicy": { "enum": ["supersede", "append"] },
+        "retry": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "infrastructure": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 10 },
+                "backoff": { "enum": ["fixed", "exponential"] }
+              }
+            },
+            "providerUnavailable": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "enabled": { "type": "boolean" } }
+            }
+          }
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reviewHistoryRetentionDays": { "type": "integer", "minimum": 0, "maximum": 3650 },
+        "findingRetentionDays": { "type": "integer", "minimum": 0, "maximum": 3650 },
+        "auditRetentionDays": { "type": "integer", "minimum": 0, "maximum": 3650 },
+        "artifactRetentionDays": { "type": "integer", "minimum": 0, "maximum": 3650 }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reloadStrategy": { "enum": ["manual", "restart"] },
+        "repositoryOverrides": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "allowedSections": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 128 } }
+          }
+        },
+        "validation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "strict": { "type": "boolean" },
+            "dryRun": { "type": "boolean" }
+          }
+        },
+        "rollbackEnabled": { "type": "boolean" }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "logs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "level": { "enum": ["fatal", "error", "warn", "info", "debug", "trace"] },
+            "format": { "enum": ["json", "pretty"] }
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "enabled": { "type": "boolean" } }
+        },
+        "tracing": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "enabled": { "type": "boolean" } }
+        },
+        "alerts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "reviewFailure": { "type": "boolean" },
+            "queueBacklog": { "type": "boolean" },
+            "providerUnavailable": { "type": "boolean" },
+            "resourceLimitExceeded": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "benchmarkSuite": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "trackFalsePositives": { "type": "boolean" },
+        "trackPrecision": { "type": "boolean" },
+        "trackReviewLatency": { "type": "boolean" },
+        "minimumQualityThreshold": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    }
+  }
+}

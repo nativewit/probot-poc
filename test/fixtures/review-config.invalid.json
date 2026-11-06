@@ -1,0 +1,18 @@
+{
+  "$schema": "./schemas/review-config-v1.schema.json",
+  "schemaVersion": 1,
+  "provider": {
+    "baseURL": "https://api.groq.com/openai/v1",
+    "apiKeyEnv": "MODEL_API_KEY",
+    "model": "llama-3.3-70b-versatile"
+  },
+  "github": {
+    "organization": "acme"
+  },
+  "review": {
+    "confidence": {
+      "minimumInline": 0.1,
+      "minimumVerified": 0.9
+    }
+  }
+}
