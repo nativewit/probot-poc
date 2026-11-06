@@ -61,9 +61,14 @@ Key properties (enforced by the compose file and asserted by
    chmod 600 deploy/.env
    ```
 
-2. Place the GitHub App private key at
-   `deploy/secrets/github-app.private-key.pem`
-   (`chmod 600`). The directory is gitignored; a `.gitkeep` keeps it in git.
+2. GitHub App private key — set **one** of these in `deploy/.env`:
+   - `GITHUB_PRIVATE_KEY_BASE64`: the PEM encoded as single-line base64
+     (`base64 -i github-app.private-key.pem | tr -d '\n'`) — the
+     deployment-friendly form for platform env tabs (Dokploy etc.);
+   - `GITHUB_PRIVATE_KEY`: the raw PEM (multiline — quote it if your env
+     file round-trips quoted values);
+   - `GITHUB_PRIVATE_KEY_PATH`: path to a PEM file available in the
+     container.
 3. `deploy/.env` is used **both** for compose variable interpolation and as
    `env_file` for `probot`, `worker` and `migrate`. Never commit it.
 4. Required variables are declared with `:?` in the compose file, so
@@ -208,12 +213,12 @@ is **not** a backup against host loss. Copy archives off-host (e.g. nightly
    this repository (or paste `deploy/docker-compose.yml`). Dokploy creates
    the external `dokploy-network` — the compose file attaches `probot` to it
    for ingress.
-2. **Environment**: paste the contents of `deploy/.env` (minus secret file
-   handling) into the service's environment settings; upload the GitHub App
-   private key as a file mount at
-   `/run/secrets/github-app.private-key.pem` (the compose `secrets:` entry
-   maps `deploy/secrets/github-app.private-key.pem` — on Dokploy mount it
-   equivalently or inline the key via `GITHUB_APP_PRIVATE_KEY`).
+2. **Environment**: paste the contents of `deploy/.env` into the service's
+   environment settings. Supply the GitHub App private key inline as
+   `GITHUB_PRIVATE_KEY_BASE64` (single-line base64 of the PEM —
+   `base64 -i github-app.private-key.pem | tr -d '\n'`) — this avoids file
+   mounts entirely, which is required on Dokploy since redeploys re-clone the
+   repo and any PEM placed in the checkout would be wiped.
 3. **Domain / HTTPS**: in the Dokploy UI, attach a domain to the `probot`
    service on port `3000`; Dokploy's Traefik edge terminates TLS and puts the
    container on `dokploy-network`. Webhook URL is

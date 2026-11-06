@@ -61,10 +61,10 @@ services:
     environment:
       DATABASE_URL: postgres://reviewer:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/reviewer
       REDIS_URL: redis://redis:6379
-      # GitHub App private key is mounted as a Docker secret, never inline.
-      GITHUB_PRIVATE_KEY_PATH: /run/secrets/github_private_key
-    secrets:
-      - github_private_key
+      # GitHub App private key material comes from deploy/.env / the platform
+      # environment as inline env vars (GITHUB_PRIVATE_KEY or the single-line
+      # GITHUB_PRIVATE_KEY_BASE64). Never committed, never logged. To use a
+      # PEM file instead, set GITHUB_PRIVATE_KEY_PATH in deploy/.env.
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -118,8 +118,6 @@ services:
       # model and the two supported options. Without a host the executor
       # fails closed and SANDBOX_ENABLED stays false (local execution only).
       SANDBOX_DOCKER_NETWORK: ai-pr-reviewer_sandbox-egress
-    secrets:
-      - github_private_key
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -259,8 +257,3 @@ networks:
     external: true
     name: ${DOKPLOY_NETWORK:-dokploy-network}
 
-secrets:
-  github_private_key:
-    # PEM file on the compose host — NEVER committed. Create it per
-    # docs/deployment.md §4: deploy/secrets/github-app.private-key.pem
-    file: ./secrets/github-app.private-key.pem

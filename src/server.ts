@@ -40,6 +40,27 @@ const logger = createLogger(env);
 getPrisma(env);
 getRedis(env);
 
+/**
+ * Decode GITHUB_PRIVATE_KEY_BASE64 (single-line, base64-encoded PEM) into
+ * PRIVATE_KEY. Base64 is the deployment-friendly form: PEMs are multiline and
+ * many platforms (e.g. Dokploy env tabs) round-trip single-line values more
+ * reliably than quoted multiline ones.
+ */
+function materializePrivateKeyFromBase64(): void {
+  const base64 = process.env.GITHUB_PRIVATE_KEY_BASE64;
+  if (!base64 || process.env.PRIVATE_KEY || process.env.PRIVATE_KEY_PATH) return;
+  try {
+    const pem = Buffer.from(base64.replace(/\s+/g, ""), "base64").toString("utf8");
+    if (pem.includes("-----BEGIN")) {
+      process.env.PRIVATE_KEY = pem;
+    }
+  } catch {
+    // Invalid base64 — fall through; the missing-credential warning below
+    // surfaces the problem without leaking any key material.
+  }
+}
+materializePrivateKeyFromBase64();
+
 function maybeCreateProbot(): Probot | undefined {
   // Probot requires APP_ID, PRIVATE_KEY and WEBHOOK_SECRET. When they are
   // absent (e.g. local dev without a GitHub App), run HTTP-only so health

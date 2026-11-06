@@ -107,11 +107,12 @@ describe("production compose structure (ticket 13)", () => {
     }
   });
 
-  it("keeps secrets out of the compose file (env_file + secret file mounts)", () => {
-    expect(compose.secrets.github_private_key.file).toBe("./secrets/github-app.private-key.pem");
-    // Private key material is referenced by PATH only, never inline.
-    expect(compose.services.probot.environment.GITHUB_PRIVATE_KEY_PATH).toBe("/run/secrets/github_private_key");
+  it("keeps secrets out of the compose file (env_file + inline env vars)", () => {
+    // Key material is never hardcoded: it arrives via deploy/.env (env_file)
+    // as GITHUB_PRIVATE_KEY / GITHUB_PRIVATE_KEY_BASE64 / GITHUB_PRIVATE_KEY_PATH.
+    expect(compose.secrets).toBeUndefined();
     const raw = readFileSync(composePath, "utf8");
+    expect(raw).not.toMatch(/PRIVATE_KEY(_BASE64|_PATH)?:\s*\S/); // no literal key values in compose
     expect(raw).not.toMatch(/PRIVATE_KEY\s*=\s*[A-Za-z0-9+/\\-]{8,}/);
     expect(raw).not.toMatch(/POSTGRES_PASSWORD\s*=\s*\S/); // interpolated from deploy/.env only
     for (const svc of ["probot", "worker", "migrate"]) {

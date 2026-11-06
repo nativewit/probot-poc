@@ -227,8 +227,14 @@ export async function stopReviewWorker(worker: Worker<ReviewJobPayload>): Promis
  */
 export function createDefaultTokenProvider(): InstallationTokenProvider {
   const appId = process.env.GITHUB_APP_ID;
-  const privateKeyPath = process.env.GITHUB_PRIVATE_KEY_PATH;
-  const privateKey = process.env.GITHUB_PRIVATE_KEY ?? (privateKeyPath ? fs.readFileSync(privateKeyPath, "utf-8") : undefined);
+  let privateKey = process.env.GITHUB_PRIVATE_KEY;
+  if (!privateKey) {
+    const privateKeyPath = process.env.GITHUB_PRIVATE_KEY_PATH;
+    if (privateKeyPath) privateKey = fs.readFileSync(privateKeyPath, "utf-8");
+  }
+  if (!privateKey && process.env.GITHUB_PRIVATE_KEY_BASE64) {
+    privateKey = Buffer.from(process.env.GITHUB_PRIVATE_KEY_BASE64.replace(/\s+/g, ""), "base64").toString("utf8");
+  }
   if (!appId || !privateKey) {
     return new NullTokenProvider();
   }
