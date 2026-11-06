@@ -1,0 +1,242 @@
+import { Worker } from "bullmq";
+import { Redis } from "ioredis";
+import type { PrismaClient } from "@prisma/client";
+import type pino from "pino";
+import { REVIEW_QUEUE_NAME, type ReviewJobPayload } from "../ingestion/queue.js";
+import { transitionReviewState } from "../ingestion/review-state.js";
+import {
+  ReviewWorkspaceService,
+  StaleCommitError,
+  ReviewRetrievalError,
+  type WorkspaceResult,
+} from "./workspace.js";
+import { redactCredentials } from "./redact.js";
+import {
+  AppInstallationTokenProvider,
+  NullTokenProvider,
+  type InstallationTokenProvider,
+} from "./credentials.js";
+import fs from "node:fs";
+import {
+  createReviewLogger,
+  startStage,
+  type ReviewCorrelation,
+} from "../observability/correlation.js";
+import { getMetricsRegistry } from "../observability/metrics.js";
+import { endSpan, reviewSpanAttributes, startSpan } from "../observability/tracing.js";
+import { classifyFailure, retryPolicyFor, type RetryPolicyConfig } from "../observability/retry.js";
+import { DEFAULT_RETRY_POLICY_CONFIG } from "../observability/retry.js";
+
+/**
+ * Review worker job processor (ticket 04).
+ *
+ * Consumes BullMQ queue "review-jobs" (concurrency from review.json
+ * `queue.concurrency`, default 1). The BullMQ jobId equals the ReviewJob.id
+ * (ticket 03 contract).
+ *
+ * IMPORTANT (ticket 03 handoff): before doing any work the processor checks
+ * the DURABLE job status. A job whose ReviewJob.status is "superseded"
+ * (replaced by a newer commit while it sat in the queue) must be skipped —
+ * the review has already been superseded in Postgres and must never run.
+ */
+export interface ProcessReviewJobDeps {
+  prisma: PrismaClient;
+  service: ReviewWorkspaceService;
+  logger: pino.Logger;
+  concurrency: number;
+  /**
+   * Hook for the agent runtime (ticket 07): invoked with the prepared
+   * workspace before cleanup. Never receives credentials. The default
+   * wiring (`createReviewEngineHook`) runs the adaptive review engine and
+   * advances the review state machine (analyzing → investigating → validating).
+   */
+  onWorkspacePrepared?: (ctx: {
+    payload: ReviewJobPayload;
+    workspace: WorkspaceResult;
+  }) => Promise<unknown>;
+  /**
+   * §12.4 retry policy (ticket 12): governs retry decisions per failure
+   * class. Defaults to the §11.3 review.json-derived defaults when omitted.
+   */
+  retryPolicy?: RetryPolicyConfig;
+}
+
+export type ProcessOutcome = "processed" | "skipped_superseded" | "skipped_status" | "failed";
+
+export async function processReviewJob(
+  jobId: string,
+  payload: ReviewJobPayload,
+  deps: ProcessReviewJobDeps,
+): Promise<ProcessOutcome> {
+  const { prisma, logger } = deps;
+  const job = await prisma.reviewJob.findUnique({ where: { id: jobId }, include: { review: true } });
+  if (!job) {
+    logger.warn({ jobId }, "ReviewJob row missing for queue job; discarding");
+    return "failed";
+  }
+
+  // Stale/outdated job supersede check (ticket 03 §4.4 handoff): a superseded
+  // job is dead on arrival — no workspace, no clone, no token minting.
+  if (job.status === "superseded") {
+    logger.info({ jobId, reviewId: job.reviewId }, "Review job superseded before processing; skipping");
+    return "skipped_superseded";
+  }
+  if (job.status !== "enqueued" && job.status !== "processing") {
+    logger.info({ jobId, status: job.status }, "Review job not in a processable state; skipping");
+    return "skipped_status";
+  }
+
+  await prisma.reviewJob.update({
+    where: { id: job.id },
+    data: { status: "processing", attempts: { increment: 1 } },
+  });
+
+  let span: ReturnType<typeof startSpan> | undefined;
+  try {
+    await transitionReviewState(job.reviewId, "preparing");
+    await transitionReviewState(job.reviewId, "cloning");
+
+    const correlation: ReviewCorrelation = {
+      review_id: job.reviewId,
+      job_id: job.id,
+      repository: payload.repositoryFullName,
+      pull_request_number: payload.pullRequestNumber,
+      head_sha: payload.headSha,
+    };
+    const reviewLogger = createReviewLogger(logger, correlation);
+    const metrics = getMetricsRegistry();
+    metrics.reviewsStarted.inc();
+    const enqueuedAt = job.createdAt instanceof Date ? job.createdAt : new Date(job.createdAt);
+    metrics.queueWait.observe(Math.max(0, (Date.now() - enqueuedAt.getTime()) / 1000));
+
+    span = startSpan("review.process", { attributes: reviewSpanAttributes(correlation) });
+
+    const cloneStage = startStage(reviewLogger, "clone");
+    const workspace = await deps.service.prepare({
+      reviewId: job.reviewId,
+      repositoryFullName: payload.repositoryFullName,
+      installationId: BigInt(payload.githubInstallationId),
+      pullRequestNumber: payload.pullRequestNumber,
+      headSha: payload.headSha,
+      baseSha: payload.baseSha ?? job.review.baseSha ?? null,
+      baseRef: null,
+    });
+    cloneStage.end();
+
+    await transitionReviewState(job.reviewId, "analyzing");
+
+    // Ticket 07: the review engine runs inside the hook (workspace is still
+    // present; it is disposed afterwards per repository.workspace config).
+    const analyzeStage = startStage(reviewLogger, "analyze");
+    await deps.onWorkspacePrepared?.({ payload, workspace });
+    analyzeStage.end();
+
+    await deps.service.cleanupAfterReview(job.reviewId);
+    await prisma.reviewJob.update({ where: { id: job.id }, data: { status: "completed" } });
+    endSpan(span);
+    const metricsRegistry = getMetricsRegistry();
+    metricsRegistry.reviewsCompleted.inc(1, { outcome: "processed" });
+    metricsRegistry.reviewDuration.observe((Date.now() - enqueuedAt.getTime()) / 1000);
+    reviewLogger.info({ jobId, reviewId: job.reviewId }, "Review retrieval processed");
+    return "processed";
+  } catch (error) {
+    const message = redactCredentials(error instanceof Error ? error.message : String(error));
+    const failureClass = classifyFailure({
+      errorCode: error instanceof ReviewRetrievalError ? error.code : null,
+      message,
+    });
+    const decision = retryPolicyFor(failureClass, deps.retryPolicy ?? DEFAULT_RETRY_POLICY_CONFIG);
+    const reviewLogger2 = createReviewLogger(logger, {
+      review_id: job.reviewId,
+      job_id: job.id,
+      repository: payload.repositoryFullName,
+      pull_request_number: payload.pullRequestNumber,
+      head_sha: payload.headSha,
+    });
+    reviewLogger2.error(
+      {
+        jobId,
+        reviewId: job.reviewId,
+        err: message,
+        failure_class: failureClass,
+        retry_decision: decision,
+      },
+      "Review retrieval failed",
+    );
+    if (span) endSpan(span, error);
+    getMetricsRegistry().reviewsFailed.inc(1, { failure_class: failureClass });
+    await deps.service.cleanupAfterFailure(job.reviewId, message).catch(() => {
+      /* cleanup is best-effort */
+    });
+    try {
+      await transitionReviewState(job.reviewId, "failed", {
+        errorCode: error instanceof ReviewRetrievalError ? error.code : "retrieval_failed",
+        errorMessage: message.slice(0, 500),
+      });
+    } catch {
+      // Review may already be in a terminal state (e.g. superseded) — fine.
+    }
+    await prisma.reviewJob
+      .update({ where: { id: job.id }, data: { status: "failed", lastError: message.slice(0, 500) } })
+      .catch(() => {
+        /* row already gone */
+      });
+    return "failed";
+  }
+}
+
+/**
+ * Start the BullMQ review worker. Connection retries are unbounded for the
+ * worker (long-lived process), unlike the outbox publisher's fast-fail
+ * connection.
+ */
+export function startReviewWorker(redisUrl: string, deps: ProcessReviewJobDeps): Worker<ReviewJobPayload> {
+  const connection = new Redis(redisUrl, {
+    // Workers need an offline queue: a brief Redis outage must not kill
+    // in-flight job processing.
+    maxRetriesPerRequest: null,
+  });
+  connection.on("error", () => {
+    // Swallow connection errors; BullMQ surfaces stalled/retry state itself.
+  });
+  const worker = new Worker<ReviewJobPayload>(
+    REVIEW_QUEUE_NAME,
+    async (job) => {
+      if (!job.id) throw new Error("BullMQ job has no id");
+      return processReviewJob(job.id, job.data, deps);
+    },
+    { connection, concurrency: deps.concurrency },
+  );
+  return worker;
+}
+
+export async function stopReviewWorker(worker: Worker<ReviewJobPayload>): Promise<void> {
+  await worker.close();
+  const connection = (worker as unknown as { connection?: Redis }).connection;
+  try {
+    await connection?.quit();
+  } catch {
+    // Already disconnected.
+  }
+}
+
+/**
+ * Default installation-token provider built from environment credentials.
+ * Falls back to a NullTokenProvider (throws on use) when no GitHub App
+ * credentials are configured. Private key material never leaves this module.
+ */
+export function createDefaultTokenProvider(): InstallationTokenProvider {
+  const appId = process.env.GITHUB_APP_ID;
+  const privateKeyPath = process.env.GITHUB_PRIVATE_KEY_PATH;
+  const privateKey = process.env.GITHUB_PRIVATE_KEY ?? (privateKeyPath ? fs.readFileSync(privateKeyPath, "utf-8") : undefined);
+  if (!appId || !privateKey) {
+    return new NullTokenProvider();
+  }
+  return new AppInstallationTokenProvider({
+    appId,
+    privateKey,
+    baseUrl: process.env.GITHUB_BASE_URL,
+  });
+}
+
+export { StaleCommitError };
