@@ -1,6 +1,7 @@
 import { Probot } from "probot";
 import { handleIssuesOpened } from "./controllers/issue.controller.js";
-import { handlePullRequest } from "./controllers/pull-request.controller.js";
+import { registerPullRequestHandlers } from "./handlers/pull-request.js";
+import { registerInstallationHandlers } from "./handlers/installation.js";
 
 export default (app: Probot) => {
   // AI triage: comment possible solutions/opinions on new issues.
@@ -12,17 +13,12 @@ export default (app: Probot) => {
     }
   });
 
-  // AI code review: comment a review on new PRs and on new commits.
-  app.on(
-    ["pull_request.opened", "pull_request.synchronize"],
-    async (context) => {
-      try {
-        await handlePullRequest(context);
-      } catch (error) {
-        context.log.error(error, "AI PR review failed");
-      }
-    },
-  );
+  // Durable review ingestion (ticket 03): persist the review request and
+  // enqueue it through the transactional outbox — the webhook handler never
+  // runs the review itself.
+  registerPullRequestHandlers(app);
+  registerInstallationHandlers(app);
+
   // For more information on building apps:
   // https://probot.github.io/docs/
 
