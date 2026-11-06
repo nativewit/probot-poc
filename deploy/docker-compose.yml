@@ -258,10 +258,14 @@ networks:
   internal:
     internal: true
   # Worker only: user-defined network that sandbox containers may join for
-  # allowlisted egress (ticket 11). No host access; attach an egress-proxy
+  # allowlisted egress (ticket 11). Attaching an `internal: true` network made
+  # this the worker's only non-internal-adjacent path and removed its default
+  # route, which caused `getaddrinfo EAI_AGAIN` for api.github.com (the `dns:`
+  # block above can't help on an internal network). External connectivity is
+  # required for GitHub API/token-minting egress. Attach an egress-proxy
   # sidecar here to enforce domain allowlists (docs/deployment.md §8).
   sandbox-egress:
-    internal: true
+    driver: bridge
   # Public edge for the Dokploy HTTPS ingress. Dokploy creates this network.
   edge:
     external: true
