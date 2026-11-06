@@ -17,7 +17,7 @@ A single compose project (`deploy/docker-compose.yml`) runs six services:
 
 | Service   | Image                       | Role                                            | Ports (host) |
 |-----------|-----------------------------|-------------------------------------------------|--------------|
-| `probot`  | `ai-pr-reviewer/app:prod`   | Probot webhook app + admin API                  | `3000` (only public port) |
+| `probot`  | `ai-pr-reviewer/app:prod`   | Probot webhook app + admin API                  | `3000` (container, Traefik ingress) |
 | `worker`  | `ai-pr-reviewer/app:prod`   | Review worker (polls Redis queue, runs opencode) | none |
 | `migrate` | `ai-pr-reviewer/app:prod`   | One-shot `prisma migrate deploy`                | none (exits 0) |
 | `postgres`| `postgres:17.6-alpine`      | Relational store                                | none |
@@ -30,7 +30,11 @@ Key properties (enforced by the compose file and asserted by
 - **Named volumes** (`postgres-data`, `redis-data`, `review-workspaces`,
   `pg-backups`) — never bind mounts. Postgres and Redis data survive
   container recreation and `compose down` (not `down -v`).
-- **No public Postgres/Redis ports.** Only `probot` publishes `3000`.
+- **No host ports published at all.** Traefik (Dokploy) reaches `probot` on
+  container port `3000` over the external `dokploy-network` — publishing a
+  host port would claim `0.0.0.0:3000` and collide with Dokploy gateway
+  endpoints. Local smoke runs use `deploy/docker-compose.local.yml`, which
+  maps `127.0.0.1:3000` only.
 - **Healthchecks** on postgres, redis, probot, worker, backup. `probot` and
   `worker` start only after `migrate` completes successfully and postgres and
   redis are healthy.
@@ -83,12 +87,20 @@ docker compose -f deploy/docker-compose.yml config -q
 # Build
 docker compose -f deploy/docker-compose.yml build
 
-# Start (migrate runs first as a one-shot; probot/worker wait for it)
-docker compose -f deploy/docker-compose.yml up -d
+# Start (migrate runs first as a one-shot; probot/worker wait for it).
+# The local override maps 127.0.0.1:3000 -> probot:3000 (the production
+# compose publishes no host ports; Dokploy Traefik handles ingress).
+docker compose \
+  -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.local.yml \
+  up -d
 
 # Verify
-docker compose -f deploy/docker-compose.yml ps        # all healthy, migrate Exited(0)
-curl -fsS http://localhost:3000/healthz               # 200
+docker compose \
+  -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.local.yml \
+  ps                                       # all healthy, migrate Exited(0)
+curl -fsS http://localhost:3000/healthz    # 200
 ```
 
 Notes from the validated smoke run (2026-11-06, local Docker):
@@ -220,8 +232,11 @@ is **not** a backup against host loss. Copy archives off-host (e.g. nightly
    mounts entirely, which is required on Dokploy since redeploys re-clone the
    repo and any PEM placed in the checkout would be wiped.
 3. **Domain / HTTPS**: in the Dokploy UI, attach a domain to the `probot`
-   service on port `3000`; Dokploy's Traefik edge terminates TLS and puts the
-   container on `dokploy-network`. Webhook URL is
+   service on **Container Port `3000`**; Dokploy's Traefik terminates TLS,
+   adds Traefik labels at deploy time, and routes traffic to the container
+   over `dokploy-network` — no host port is published (which avoids host
+   port collisions with Dokploy gateway endpoints). Use **Preview Compose**
+   to verify the injected labels. Webhook URL is
    `https://<your-domain>/api/github/webhooks`.
 4. **Deploy**, then follow §4 verification. Do not expose postgres/redis —
    they have no published ports and remain on the internal network.
@@ -232,7 +247,8 @@ is **not** a backup against host loss. Copy archives off-host (e.g. nightly
 Scenarios from architecture §10.4, with local verification status:
 
 1. **Clean deploy** — verified: `up -d` from scratch; migrate Exited(0);
-   all services healthy; only port 3000 published.
+   all services healthy; no host ports published (local override adds
+   127.0.0.1:3000).
 2. **GitHub App install + real PR review** — *user-environment step*: needs
    real app credentials and a live webhook URL (Dokploy). Locally probot
    starts degraded (no webhooks) by design; see probot warning log.

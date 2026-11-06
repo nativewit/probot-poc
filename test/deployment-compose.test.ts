@@ -36,9 +36,18 @@ describe("production compose structure (ticket 13)", () => {
     }
   });
 
-  it("publishes exactly one port, on probot only, for HTTPS ingress", () => {
-    expect(compose.services.probot.ports).toHaveLength(1);
-    expect(String(compose.services.probot.ports[0])).toMatch(/:\s*3000$/);
+  it("publishes NO host ports for any service (Dokploy Traefik ingress)", () => {
+    // On Dokploy, Traefik routes to probot's container port over
+    // dokploy-network (Domains tab). Publishing host ports would claim
+    // 0.0.0.0:3000 and collide with Dokploy gateway endpoints. Local runs
+    // use deploy/docker-compose.local.yml for a localhost-only mapping.
+    for (const svc of Object.keys(compose.services)) {
+      expect("ports" in compose.services[svc], `${svc} has no ports key`).toBe(false);
+    }
+  });
+
+  it("exposes container port 3000 on probot for the Traefik ingress", () => {
+    expect(compose.services.probot.expose).toEqual(["3000"]);
   });
 
   it("uses named volumes for all persistent data (§17.1)", () => {

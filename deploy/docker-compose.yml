@@ -4,8 +4,10 @@
 # postgres, redis, plus one-shot `migrate` and the scheduled `backup` service.
 #
 # Rules encoded here:
-#   - PostgreSQL and Redis have NO published ports (internal network only).
-#   - Only probot publishes a port (for the Dokploy/Traefik HTTPS ingress).
+#   - NOTHING publishes a host port. Dokploy's Traefik routes to probot's
+#     container port 3000 over the external dokploy-network (Domains tab:
+#     Container Port = 3000). For local smoke runs use the override file
+#     deploy/docker-compose.local.yml (adds a localhost port mapping).
 #   - Persistent data lives in named volumes (§17.1) — never bind mounts.
 #   - Secrets come from deploy/.env (env_file, interpolated). NEVER commit
 #     deploy/.env or deploy/secrets/*.
@@ -52,10 +54,12 @@ services:
     # (src/lib/shutdown.ts). stop_grace_period gives in-flight requests and
     # queue cleanup time to finish.
     stop_grace_period: 30s
-    ports:
-      # Only public-facing service. In Dokploy, Traefik terminates HTTPS on
-      # this port per docs/deployment.md §5.
-      - "${PROBOT_PORT:-3000}:3000"
+    # Container port only — no host binding. On Dokploy, Traefik reaches
+    # probot over dokploy-network and routes the configured domain to this
+    # port (Domains tab → Container Port 3000). Host publishing would claim
+    # 0.0.0.0:3000 on the host and collide with Dokploy's gateway endpoints.
+    expose:
+      - "3000"
     env_file:
       - ./.env
     environment:
