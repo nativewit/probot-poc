@@ -1,0 +1,23 @@
+# Sandbox execution image (ticket 11, §10.4).
+#
+# Minimal, non-root, read-only-friendly image for executing allowlisted
+# commands against untrusted review workspaces. Deliberately tiny: git, grep,
+# find and coreutils for static analysis. No shells beyond the busybox/dash
+# base, no package managers usable at runtime, no network tooling.
+#
+# Build: docker build -q -f docker/sandbox/Dockerfile.sandbox docker/sandbox
+# (the DockerSandboxExecutor does this automatically when the image is
+# missing). Never mount the Docker socket into containers using this image.
+
+FROM alpine:3.20
+
+RUN apk add --no-cache git grep findutils coreutils \
+  && addgroup -S sandbox \
+  && adduser -S -G sandbox -h /home/sandbox -s /sbin/nologin sandbox \
+  && mkdir -p /home/sandbox /work \
+  && chown -R sandbox:sandbox /home/sandbox /work
+
+USER sandbox
+WORKDIR /work
+
+# No ENTRYPOINT/CMD: the executor supplies argv directly (never a shell).

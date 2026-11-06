@@ -1,0 +1,266 @@
+# Production Docker Compose — AI PR Reviewer (ticket 13, ARCHITECTURE.md §18).
+#
+# One Compose project: probot (webhook + admin API + metrics), review-worker,
+# postgres, redis, plus one-shot `migrate` and the scheduled `backup` service.
+#
+# Rules encoded here:
+#   - PostgreSQL and Redis have NO published ports (internal network only).
+#   - Only probot publishes a port (for the Dokploy/Traefik HTTPS ingress).
+#   - Persistent data lives in named volumes (§17.1) — never bind mounts.
+#   - Secrets come from deploy/.env (env_file, interpolated). NEVER commit
+#     deploy/.env or deploy/secrets/*.
+#   - No Docker socket is mounted anywhere (§10.4). Sandbox execution goes
+#     through SANDBOX_DOCKER_HOST (remote docker endpoint) — see
+#     docs/deployment.md §8.
+#
+# Validate:  docker compose -f deploy/docker-compose.yml config
+# Smoke:     docs/deployment.md §9 (local smoke deployment)
+# Runbook:   docs/deployment.md §10 (demo/validation scenarios)
+
+name: ai-pr-reviewer
+
+x-app-build: &app-build
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: ai-pr-reviewer/app:prod
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+  # One-shot Prisma migration (§17 migration procedure). probot and worker
+  # wait for it to complete before starting. `prisma migrate deploy` only
+  # applies pending migrations — idempotent on every restart/redeploy.
+  migrate:
+    <<: *app-build
+    restart: "no"
+    command: ["npx", "prisma", "migrate", "deploy"]
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: postgres://reviewer:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/reviewer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+
+  probot:
+    <<: [*app-build, *restart]
+    # node is PID 1 => SIGTERM reaches the app for graceful shutdown
+    # (src/lib/shutdown.ts). stop_grace_period gives in-flight requests and
+    # queue cleanup time to finish.
+    stop_grace_period: 30s
+    ports:
+      # Only public-facing service. In Dokploy, Traefik terminates HTTPS on
+      # this port per docs/deployment.md §5.
+      - "${PROBOT_PORT:-3000}:3000"
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: postgres://reviewer:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/reviewer
+      REDIS_URL: redis://redis:6379
+      # GitHub App private key is mounted as a Docker secret, never inline.
+      GITHUB_PRIVATE_KEY_PATH: /run/secrets/github_private_key
+    secrets:
+      - github_private_key
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # Read-only root filesystem; only /tmp is writable (§18.3 hardening).
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    networks:
+      - internal
+      # Public ingress edge (Dokploy). External network created by Dokploy.
+      - edge
+
+  worker:
+    <<: [*app-build, *restart]
+    stop_grace_period: 60s # reviews are long; let the current job checkpoint
+    command: ["node", "lib/worker.js"]
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: postgres://reviewer:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/reviewer
+      REDIS_URL: redis://redis:6379
+      WORKSPACE_ROOT_DIR: /app/workspaces
+      # Worker-side /metrics endpoint (§16.2) — also drives the healthcheck.
+      METRICS_PORT: "9100"
+      METRICS_HOST: "0.0.0.0"
+      # Agent runtime binary (ticket 06) — installed by the Dockerfile at a
+      # fixed path instead of the macOS developer default.
+      OPENCODE_BINARY_PATH: /usr/local/bin/opencode
+      # Sandbox execution (ticket 11): the worker never mounts the Docker
+      # socket. It drives sandbox containers through a remote docker endpoint
+      # (SANDBOX_DOCKER_HOST) — see docs/deployment.md §8 for the isolation
+      # model and the two supported options. Without a host the executor
+      # fails closed and SANDBOX_ENABLED stays false (local execution only).
+      SANDBOX_DOCKER_NETWORK: ai-pr-reviewer_sandbox-egress
+    secrets:
+      - github_private_key
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - review-workspaces:/app/workspaces
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:9100/metrics').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0" # §18.4 starting value (concurrency 1)
+          memory: 2G
+    networks:
+      - internal
+      - sandbox-egress
+
+  postgres:
+    # Pinned minor (§18.3). No `ports:` — reachable only on `internal`.
+    image: postgres:17.6-alpine
+    <<: *restart
+    stop_grace_period: 30s
+    environment:
+      POSTGRES_DB: reviewer
+      POSTGRES_USER: reviewer
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U reviewer -d reviewer
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    networks:
+      - internal
+
+  redis:
+    # Pinned minor. AOF persistence for queue recovery (§11.3, §17.2).
+    # No `ports:` — reachable only on `internal`.
+    image: redis:7.4-alpine
+    <<: *restart
+    stop_grace_period: 30s
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    networks:
+      - internal
+
+  backup:
+    # Daily pg_dump with configurable retention (§17.2). Built from
+    # deploy/backup/Dockerfile (pinned postgres image + backup scripts).
+    # Healthcheck fails when the newest backup is older than
+    # BACKUP_MAX_AGE_HOURS (surfaces stale backups in `docker compose ps`).
+    build:
+      context: ./backup
+      dockerfile: Dockerfile
+    image: ai-pr-reviewer/backup:prod
+    <<: *restart
+    stop_grace_period: 30s
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: reviewer
+      PGUSER: reviewer
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_MAX_AGE_HOURS: ${BACKUP_MAX_AGE_HOURS:-26}
+      BACKUP_RUN_ON_START: ${BACKUP_RUN_ON_START:-1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - pg-backups:/backups
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /usr/local/bin/backup-health.sh
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    networks:
+      - internal
+
+volumes:
+  postgres-data: # §17.1 — survives container recreation (NOT a backup)
+  redis-data: # AOF queue persistence
+  review-workspaces: # per-review workspaces, retention-swept (ticket 04)
+  pg-backups: # pg_dump archives — replicate off-host (docs/deployment.md §7)
+
+networks:
+  # Database, worker, migrate, backup — no external connectivity.
+  internal:
+    internal: true
+  # Worker only: user-defined network that sandbox containers may join for
+  # allowlisted egress (ticket 11). No host access; attach an egress-proxy
+  # sidecar here to enforce domain allowlists (docs/deployment.md §8).
+  sandbox-egress:
+    internal: true
+  # Public edge for the Dokploy HTTPS ingress. Dokploy creates this network.
+  edge:
+    external: true
+    name: ${DOKPLOY_NETWORK:-dokploy-network}
+
+secrets:
+  github_private_key:
+    # PEM file on the compose host — NEVER committed. Create it per
+    # docs/deployment.md §4: deploy/secrets/github-app.private-key.pem
+    file: ./secrets/github-app.private-key.pem

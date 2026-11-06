@@ -25,6 +25,20 @@ docker build -t probot-poc .
 docker run -e APP_ID=<app-id> -e PRIVATE_KEY=<pem-value> probot-poc
 ```
 
+## Production deployment
+
+The full production stack (app, worker, migrations, PostgreSQL, Redis, and
+scheduled backups) deploys with one Compose project:
+
+```sh
+cp deploy/.env.prod.example deploy/.env   # fill in secrets (gitignored)
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+See **[docs/deployment.md](docs/deployment.md)** for prerequisites,
+secrets setup, Dokploy deployment, backup/restore procedures, and the
+validation runbook.
+
 ## Contributing
 
 If you have suggestions for how probot-poc could be improved, or want to report a bug, open an issue! We'd love all and any contributions.
