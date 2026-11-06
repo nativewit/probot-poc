@@ -284,7 +284,7 @@ function makeFakeOctokit(state: FakeState): PublisherOctokit {
           state.getPullCalls += 1;
           return { data: { head: { sha: state.currentSha } } };
         },
-        listComments: async () => ({ data: state.existingComments }),
+        listReviewComments: async () => ({ data: state.existingComments }),
         listReviews: async () => ({ data: state.existingReviews }),
         createReview: async (params: {
           event: string;

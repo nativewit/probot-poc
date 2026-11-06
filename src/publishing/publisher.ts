@@ -51,7 +51,7 @@ export interface PublisherOctokit {
       get(params: { owner: string; repo: string; pull_number: number }): Promise<{
         data: { head: { sha?: string | null } };
       }>;
-      listComments(params: {
+      listReviewComments(params: {
         owner: string;
         repo: string;
         pull_number: number;
@@ -247,8 +247,15 @@ export async function publishReview(input: PublishReviewInput): Promise<PublishR
   const existingComments = await listAll(
     (page) =>
       withRetry(
-        "pulls.listComments",
-        () => octokit.rest.pulls.listComments({ owner, repo, pull_number: pullNumber, per_page: 100, page }),
+        "pulls.listReviewComments",
+        () =>
+          octokit.rest.pulls.listReviewComments({
+            owner,
+            repo,
+            pull_number: pullNumber,
+            per_page: 100,
+            page,
+          }),
         retryOptions,
         logger,
       ).then((r) => r.data),
