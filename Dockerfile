@@ -59,6 +59,13 @@ COPY prisma ./prisma
 # URLs, so we must build the full engine-backed client here.
 RUN npx prisma generate
 COPY --from=build /app/lib ./lib
+# Review workspace root (ticket 04). The worker runs as USER node (uid 1000)
+# and clones reviewed repositories under /app/workspaces, which is a named
+# volume in production (deploy/docker-compose.yml). The directory must exist
+# in the image owned by node BEFORE the volume is mounted — otherwise Docker
+# creates the mountpoint as root:root 0755 and git fails with
+# "could not create work tree dir: Permission denied".
+RUN mkdir -p /app/workspaces && chown node:node /app/workspaces
 # Review pipeline configuration (ticket 13): the worker loads config/review.json
 # at startup and fails closed when it is missing.
 COPY --chown=node:node config ./config
