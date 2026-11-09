@@ -20,3 +20,4 @@ tsconfig.tsbuildinfo
 # Production deployment secrets (ticket 13) — never commit
 deploy/.env
 deploy/secrets/*
+deploy/dozzle/users.yml

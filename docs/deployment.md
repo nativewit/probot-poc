@@ -242,7 +242,89 @@ is **not** a backup against host loss. Copy archives off-host (e.g. nightly
    they have no published ports and remain on the internal network.
 5. **Backups**: replicate the `pg-backups` volume off-host (§7.4).
 
-## 10. Validation runbook
+## 10. Dozzle — live container log viewer (operations stack)
+
+[Dozzle](https://dozzle.dev) gives a real-time web UI over `docker logs` for
+every container on the host. It is **deliberately a separate Compose project**
+(`deploy/docker-compose.dozzle.yml`, project name `ai-pr-reviewer-logs`) — an
+operations tool, not an application dependency:
+
+- The app stack's §10.4 invariant "never mount the Docker socket in the app
+  stack" and its no-published-ports rule stay untouched; the socket mount
+  lives only in the Dozzle project. `test/deployment-compose.test.ts` is
+  unchanged; `test/deployment-dozzle.test.ts` pins the new file's structure.
+- **Same daemon requirement**: Dozzle sees the containers of the host whose
+  socket it reads. Deploy it on the Dokploy host itself (a second *Compose*
+  service in the same Dokploy project) — not in another container, VM or
+  server.
+
+### 10.1 Setup
+
+1. **Generate credentials** (one-time, on any machine with Docker; the file
+   is gitignored and must never be committed):
+
+   ```sh
+   mkdir -p deploy/dozzle
+   docker run -it --rm amir20/dozzle:v11.4.1 generate admin \
+     --email ops@yourdomain.com --name "Ops Admin" \
+     > deploy/dozzle/users.yml
+   ```
+
+   Omit `--password` to be prompted on stdin. Dozzle v11 uses the `simple`
+   auth provider reading `/data/users.yml` (bcrypt hashes) — the old
+   `DOZZLE_USER_*` env vars no longer exist. Without `users.yml` the login
+   fails closed: there is no anonymous access.
+
+   On Dokploy the checkout is re-cloned on redeploy, so the in-repo
+   `deploy/dozzle/users.yml` default can be wiped. Generate the file once at
+   a persistent host path (e.g. `/etc/dozzle/users.yml`) and set
+   `DOZZLE_USERS_FILE=/etc/dozzle/users.yml` for the Compose service.
+2. **Deploy**: create a second *Compose* service in Dokploy pointing at
+   `deploy/docker-compose.dozzle.yml`, and attach a domain (e.g.
+   `logs.yourdomain.com`) to the `dozzle` service with **Container Port
+   `8080`**. Traefik terminates TLS and routes over `dokploy-network`; no
+   host port is published (matches the main stack's invariant).
+3. **Log in**: browse to the domain (e.g. `https://logs.yourdomain.com`) or,
+   for a local smoke run, `http://127.0.0.1:8080`. Dozzle redirects to
+   `/login`; sign in with:
+   - **username** — the first argument to the `generate` command above
+     (`admin` in the example),
+   - **password** — the value typed at the `--password` prompt.
+   
+   `users.yml` stores only bcrypt hashes, so a forgotten password cannot be
+   recovered. Regenerate the entry (rerun `generate`) and redeploy/restart.
+   To add another user, run `generate <username>` again and append its block
+   to the same `users.yml`.
+4. **Verify**: after logging in, confirm the `ai-pr-reviewer-*` containers
+   appear in the list.
+
+Local smoke run without Dokploy/Traefik (localhost-only binding):
+
+```sh
+docker compose \
+  -f deploy/docker-compose.dozzle.yml \
+  -f deploy/docker-compose.dozzle.local.yml \
+  up -d   # http://127.0.0.1:8080
+```
+
+### 10.2 Security posture and caveats
+
+- **The Docker socket is root-equivalent on the host.** A read-only mount
+  (`:ro`) restricts the file on disk, **not** the Docker API — the container
+  can still exec into other containers, read their filesystems via mounts,
+  etc. Treat Dozzle as privileged infrastructure.
+- Mitigations in place: authentication required, `DOZZLE_ENABLE_ACTIONS`
+  / `DOZZLE_ENABLE_SHELL` / `DOZZLE_ENABLE_MCP` all disabled, pinned image
+  (`v11.4.1`), resource limits, socket mounted read-only.
+- **Restrict the domain to admin IPs or a VPN** (firewall rule, Dokploy
+  Traefik IP-allow middleware, or your edge firewall) where practical —
+  auth alone should not be the only gate.
+- If you want to hard-limit the API itself, front the socket with a
+  read-only proxy ([tecnativa/docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy))
+  and point Dozzle at `DOCKER_HOST=tcp://socket-proxy:2375` instead of
+  mounting the socket directly.
+
+## 11. Validation runbook
 
 Scenarios from architecture §10.4, with local verification status:
 

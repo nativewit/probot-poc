@@ -1,0 +1,97 @@
+# Dozzle — live container-log viewer (https://dozzle.dev).
+#
+# This is a SEPARATE Compose project on purpose: it is an operations tool,
+# not an application dependency. Keeping it out of deploy/docker-compose.yml
+# preserves that stack's hard invariants (§10.4 "never mount the Docker
+# socket in the app stack", no published host ports) and the tests that
+# enforce them — the socket mount lives only here.
+#
+# Requirements:
+#   - MUST be deployed on the SAME Docker daemon as ai-pr-reviewer — Dozzle
+#     sees the containers of the host whose socket it reads. Run it on the
+#     Dokploy host, not in another container/VM.
+#   - The Docker socket is root-equivalent on the host. Mitigations here:
+#     read-only mount, authentication REQUIRED (users.yml), container
+#     actions and shell access disabled, TLS terminated by Traefik.
+#     Note that `:ro` limits the file, not the Docker API — if you want API
+#     write-protection too, front the socket with a socket proxy
+#     (tecnativa/docker-socket-proxy) instead of mounting it directly.
+#
+# Auth: Dozzle v11 uses the `simple` provider with a users.yml file.
+# Generate it ONCE on the host (never committed):
+#
+#   mkdir -p deploy/dozzle
+#   docker run -it --rm amir20/dozzle:v11.4.1 generate admin \
+#     --email ops@yourdomain.com --name "Ops Admin" \
+#     > deploy/dozzle/users.yml
+#
+# (omit --password to be prompted on stdin; the file contains bcrypt hashes)
+#
+# On Dokploy the repo checkout is re-cloned on redeploy, so keep users.yml on a
+# persistent host path and set DOZZLE_USERS_FILE to it (e.g. /etc/dozzle/users.yml).
+#
+# Ingress: no host port is published. In Dokploy, add a second *Compose*
+# service pointing at this file and attach a domain (e.g. logs.yourdomain.com)
+# to the `dozzle` service with Container Port `8080`; Traefik terminates TLS
+# and routes over dokploy-network. Restrict the domain to admin IPs/VPN where
+# possible. Local smoke (no Dokploy): use docker-compose.dozzle.local.yml.
+#
+# Validate: docker compose -f deploy/docker-compose.dozzle.yml config
+
+name: ai-pr-reviewer-logs
+
+services:
+  dozzle:
+    # Pinned release (matches the generate command above). Bump deliberately.
+    image: amir20/dozzle:v11.4.1
+    restart: unless-stopped
+    # The one mount the whole point of Dozzle depends on. Read-only on disk.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Generated locally (see header); deploy/dozzle/users.yml is gitignored.
+      # On Dokploy the repo checkout is re-cloned on redeploy, so that in-repo
+      # default can be wiped — point DOZZLE_USERS_FILE at a persistent host
+      # path (e.g. /etc/dozzle/users.yml) for production.
+      - ${DOZZLE_USERS_FILE:-./dozzle/users.yml}:/data/users.yml:ro
+    # Simple auth is mandatory for this deployment — Dozzle must never start
+    # unauthenticated on an ingress-reachable network. It fails closed: if
+    # users.yml is missing, login is impossible (no anonymous access).
+    environment:
+      DOZZLE_AUTH_PROVIDER: simple
+      # Mutating capabilities off (docs: keep actions/shell disabled unless
+      # needed). Defaults are already false; pinned explicitly as a guard.
+      DOZZLE_ENABLE_ACTIONS: "false"
+      DOZZLE_ENABLE_SHELL: "false"
+      DOZZLE_ENABLE_MCP: "false"
+      DOZZLE_NO_ANALYTICS: "true"
+      DOZZLE_DISABLE_SETUP_WIZARD: "true"
+      DOZZLE_HOSTNAME: dokploy-host
+    # Container port only — Dokploy Traefik reaches it over dokploy-network
+    # (Domains tab → Container Port 8080). No host binding, matching the
+    # main stack's no-published-ports invariant.
+    expose:
+      - "8080"
+    # Dozzle talks to the local socket (no network egress needed) and serves
+    # the UI to Traefik on the edge network. Nothing else.
+    networks:
+      - edge
+    healthcheck:
+      # The image is `scratch` with the binary at /dozzle (not on PATH).
+      test: ["CMD", "/dozzle", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+networks:
+  # Public edge (Dokploy HTTPS ingress). Same external network the main
+  # stack's probot uses — Dokploy creates it; name overridable for parity.
+  edge:
+    external: true
+    name: ${DOKPLOY_NETWORK:-dokploy-network}
