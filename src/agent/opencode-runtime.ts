@@ -159,9 +159,18 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
       `${options.reviewId}-${sessionIdKey(id)}`,
     );
     const configDir = path.join(sessionDir, "config");
+    // OpenCode resolves its *global* config from
+    // `$XDG_CONFIG_HOME/opencode/opencode.json` (not directly under
+    // `$XDG_CONFIG_HOME`). Writing one level too high makes OpenCode silently
+    // ignore the whole generated config — including `plugins`, `model` and the
+    // custom provider — which looks exactly like "the plugin is configured but
+    // never loads".
+    const opencodeConfigDir = path.join(configDir, "opencode");
     const dataDir = path.join(sessionDir, "data");
-    await mkdir(configDir, { recursive: true });
+    const stateDir = path.join(sessionDir, "state");
+    await mkdir(opencodeConfigDir, { recursive: true });
     await mkdir(dataDir, { recursive: true });
+    await mkdir(stateDir, { recursive: true });
 
     const modelId = resolveModelId(this.config, process.env);
     const maxOutputTokens = options.maxOutputTokens ?? this.config.agent.context.maxOutputTokens;
@@ -177,12 +186,15 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
     });
     // The config file contains no secret material — the API key is a
     // `{env:VAR}` reference resolved from the child environment.
+    const configPath = path.join(opencodeConfigDir, "opencode.json");
     await writeFile(
-      path.join(configDir, "opencode.json"),
+      configPath,
       JSON.stringify(sessionConfig, null, 2),
       "utf8",
     );
 
+    const langfuseBaseUrl =
+      process.env.LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASEURL;
     this.logger?.info("agent session created", {
       event: "agent_session_created",
       sessionId: id,
@@ -194,7 +206,7 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
       workspacePath: options.workspacePath,
       maxOutputTokens,
       timeoutMs: options.timeoutMs ?? this.defaultTimeoutMs,
-      configPath: path.join(configDir, "opencode.json"),
+      configPath,
       agentTracing: this.config.observability?.langfuse?.enabled
         ? (this.config.observability.langfuse.plugin ?? DEFAULT_LANGFUSE_PLUGIN)
         : "off",
@@ -205,8 +217,8 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
         ? {
             publicKeyPresent: Boolean(process.env.LANGFUSE_PUBLIC_KEY),
             secretKeyPresent: Boolean(process.env.LANGFUSE_SECRET_KEY),
-            baseUrl: process.env.LANGFUSE_BASE_URL
-              ? endpointLabel(process.env.LANGFUSE_BASE_URL)
+            baseUrl: langfuseBaseUrl
+              ? endpointLabel(langfuseBaseUrl)
               : "default(cloud)",
             environment: process.env.LANGFUSE_ENVIRONMENT ?? "default(development)",
             pluginCachePresent: existsSync(
@@ -231,13 +243,22 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
     }
     const startedAt = Date.now();
     const prompt = buildPrompt(task);
-    const args = ["run", "--format", "json", prompt];
+    // `--print-logs` forwards the OpenCode server's plugin lifecycle and
+    // Langfuse diagnostics to stderr. Without it plugin initialization and
+    // "tracing disabled / export failed" messages are completely invisible,
+    // which made a silent tracing failure look like a working integration.
+    // stdout stays pure NDJSON, so event parsing is unaffected.
+    const args = ["run", "--format", "json", "--print-logs", prompt];
     const env = buildChildEnv(this.config, process.env, { reviewId: session.reviewId });
     const modelId = resolveModelId(this.config, process.env);
-    // Isolation: fresh per-session config/data; binary from PATH; no git
+    // Isolation: fresh per-session config/data/state; binary from PATH; no git
     // credential helpers, no GITHUB_TOKEN, nothing else from the host env.
-    env.XDG_CONFIG_HOME = path.join(os.tmpdir(), "opencode-review-sessions", sessionDirKey(session), "config");
-    env.XDG_DATA_HOME = path.join(os.tmpdir(), "opencode-review-sessions", sessionDirKey(session), "data");
+    // The state dir is per-session too, otherwise `opencode run` can attach to
+    // a shared background service and ignore this session's env/config/tags.
+    const sessionDir = sessionRoot(session);
+    env.XDG_CONFIG_HOME = path.join(sessionDir, "config");
+    env.XDG_DATA_HOME = path.join(sessionDir, "data");
+    env.XDG_STATE_HOME = path.join(sessionDir, "state");
 
     this.logger?.info("agent execute started", {
       event: "agent_execute_started",
@@ -528,22 +549,28 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
           return;
         }
 
-        // stderr: promote likely diagnostics to warn, everything else debug.
+        // stderr: promote likely diagnostics to warn, plugin/tracing lifecycle
+        // to info, everything else debug.
         const looksLikeError =
           /error|fail|fatal|exception|unauthor|forbidden|timeout|refused|denied|not found|401|403|404|429|5\d\d/i.test(
             trimmed,
           );
+        // The plugin is silent unless its own diagnostics are surfaced: a
+        // missing-credentials or export failure must never hide at debug level.
+        const isTracing =
+          /langfuse|opencode-observability|loading plugin|tracing disabled/i.test(trimmed);
         const summary = truncate(scrub(trimmed, this.config), MAX_LOG_LINE_CHARS);
         const payload = {
           event: "agent_child_output",
           sessionId,
           reviewId,
           stream,
-          event_type: "stderr",
+          event_type: isTracing ? "tracing" : "stderr",
           summary,
           truncated: summary.endsWith("…[truncated]"),
         };
         if (looksLikeError) this.logger?.warn("agent child output", payload);
+        else if (isTracing) this.logger?.info("agent tracing output", payload);
         else this.logger?.debug("agent child output", payload);
       };
 
@@ -909,6 +936,10 @@ function scrub(text: string, config: AgentRuntimeConfigSource): string {
   let out = text;
   const key = process.env[config.provider.apiKeyEnv];
   if (key) out = out.split(key).join("[redacted]");
+  // Plugin/server diagnostics are now forwarded (--print-logs); never let the
+  // Langfuse secret key appear in worker logs or error details.
+  const langfuseSecret = process.env.LANGFUSE_SECRET_KEY;
+  if (langfuseSecret) out = out.split(langfuseSecret).join("[redacted]");
   out = out.replace(/(authorization|api[-_]?key|x-api-key)["'=:\s]+\S+/gi, '$1[redacted]');
   return out;
 }

@@ -133,7 +133,9 @@ const CHILD_ENV_ALLOWLIST = [
 const LANGFUSE_ENV_ALLOWLIST = [
   "LANGFUSE_PUBLIC_KEY",
   "LANGFUSE_SECRET_KEY",
+  // The plugin accepts both spellings (the SDK historically used BASEURL).
   "LANGFUSE_BASE_URL",
+  "LANGFUSE_BASEURL",
   "LANGFUSE_ENVIRONMENT",
   "LANGFUSE_USER_ID",
 ] as const;
@@ -236,12 +238,17 @@ export function buildSessionConfig(input: OpenCodeSessionConfigInput): Record<st
     // OpenCode 2 uses the plural `plugins` key. The plugin package is public;
     // Langfuse credentials are supplied through the child environment only.
     ...(langfuse?.enabled ? { plugins: [pluginEntry] } : {}),
+    // OpenCode 2 provider shape: `package` selects the provider implementation
+    // and `settings` carries its options. The v1 `npm`/`options` keys are NOT
+    // read here — with them OpenCode silently ignores the provider and falls
+    // back to its default model (verified against v2.2.6: zero requests reach
+    // the configured endpoint).
     providers: {
       reviewer: {
         name: "Review Model Provider",
         env: [config.provider.apiKeyEnv],
-        npm: "@opencode/ai/providers/openai-compatible",
-        options: {
+        package: "@opencode/ai/providers/openai-compatible",
+        settings: {
           baseURL: config.provider.baseURL,
           apiKey: `{env:${config.provider.apiKeyEnv}}`,
           timeout: config.provider.timeoutMs,

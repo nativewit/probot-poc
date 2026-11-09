@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ChildProcess } from "node:child_process";
 import {
   buildChildEnv,
@@ -145,6 +148,12 @@ async function startedSession(
   return { session, workspace };
 }
 
+/** Mirror the runtime's deterministic session root for filesystem assertions. */
+function sessionRootFor(session: AgentSession): string {
+  const shortId = session.id.replace(/^sess_/, "").slice(0, 8);
+  return path.join(os.tmpdir(), "opencode-review-sessions", `${session.reviewId}-${shortId}`);
+}
+
 // ---------------------------------------------------------------------------
 // Config building
 // ---------------------------------------------------------------------------
@@ -206,6 +215,39 @@ describe("opencode config building", () => {
     expect(json).toContain("llm.example.test/compat");
     // Agent tracing is off by default — no plugin is loaded.
     expect(json).not.toContain("langfuse");
+  });
+
+  it("emits the OpenCode 2 provider shape (package/settings, not npm/options)", () => {
+    const cfg = buildSessionConfig({
+      sessionDir: "/tmp/s",
+      workspacePath: "/tmp/w",
+      config: baseConfig,
+      modelId: "workers-ai/@cf/zai-org/glm-4.7-flash",
+      maxOutputTokens: 4000,
+    }) as {
+      providers: {
+        reviewer: Record<string, unknown> & {
+          package?: string;
+          settings?: Record<string, unknown>;
+          models: Record<string, Record<string, unknown>>;
+        };
+      };
+    };
+    const reviewer = cfg.providers.reviewer;
+    // OpenCode 2 reads `package` + `settings`. The v1 `npm`/`options` keys are
+    // ignored and make it fall back to the default model silently.
+    expect(reviewer.package).toBe("@opencode/ai/providers/openai-compatible");
+    expect(reviewer.settings).toMatchObject({
+      baseURL: baseConfig.provider.baseURL,
+      apiKey: "{env:MODEL_API_KEY}",
+      timeout: baseConfig.provider.timeoutMs,
+    });
+    expect(reviewer.npm).toBeUndefined();
+    expect(reviewer.options).toBeUndefined();
+    expect(reviewer.models.glm).toMatchObject({
+      modelID: "workers-ai/@cf/zai-org/glm-4.7-flash",
+      limit: { context: baseConfig.agent.context.maxInputTokens, output: 4000 },
+    });
   });
 
   it("enables the pinned Langfuse OpenCode plugin only when configured", () => {
@@ -278,6 +320,15 @@ describe("opencode config building", () => {
     // Thin correlation adapter: traces can be filtered back to the review.
     expect(env.LANGFUSE_USER_ID).toBe("review:rev_42");
 
+    // The plugin also accepts the legacy BASEURL spelling; it must not be
+    // dropped by the child env allowlist (otherwise self-hosted setups fall
+    // back to cloud.langfuse.com).
+    const legacyBaseUrl = buildChildEnv(
+      { ...baseConfig, observability: { langfuse: { enabled: true } } },
+      { LANGFUSE_BASEURL: "https://langfuse.legacy.test" },
+    );
+    expect(legacyBaseUrl.LANGFUSE_BASEURL).toBe("https://langfuse.legacy.test");
+
     const disabled = buildChildEnv(baseConfig, {
       LANGFUSE_PUBLIC_KEY: "pk-lf-test",
       LANGFUSE_SECRET_KEY: "sk-lf-test",
@@ -307,6 +358,39 @@ describe("session lifecycle", () => {
           agent: { ...baseConfig.agent, runtime: { ...baseConfig.agent.runtime, type: "custom" } },
         }),
     ).toThrowError(AgentRuntimeError);
+  });
+
+  it("writes the generated config where OpenCode actually reads it", async () => {
+    const { stub } = makeSpawnStub(new FakeChild());
+    const runtime = new OpenCodeAgentRuntime(
+      { ...baseConfig, observability: { langfuse: { enabled: true } } },
+      { spawnImpl: stub },
+    );
+    const session = await runtime.startSession({
+      reviewId: "rev_path",
+      workspacePath: "/tmp/w",
+      traceCorrelation: { repository: "acme/widgets", pullRequestNumber: 3 },
+    });
+    const root = sessionRootFor(session);
+    // OpenCode 2 resolves global config from
+    // `$XDG_CONFIG_HOME/opencode/opencode.json`; `$XDG_CONFIG_HOME/opencode.json`
+    // is ignored entirely (verified against v2.2.6).
+    const configPath = path.join(root, "config", "opencode", "opencode.json");
+    expect(existsSync(configPath)).toBe(true);
+    expect(existsSync(path.join(root, "config", "opencode.json"))).toBe(false);
+
+    const parsed = JSON.parse(readFileSync(configPath, "utf8")) as {
+      model?: string;
+      plugins?: unknown;
+    };
+    expect(parsed.model).toBe("reviewer/glm");
+    expect(parsed.plugins).toEqual([
+      {
+        package: "@langfuse/opencode-observability-plugin@0.7.0",
+        options: { tags: ["review:rev_path", "repository:acme/widgets", "pr:3"] },
+      },
+    ]);
+    rmSync(root, { recursive: true, force: true });
   });
 
   it("terminate kills in-flight execution and destroys the session directory", async () => {
@@ -341,13 +425,21 @@ describe("execute: successful tasks", () => {
 
     const resultPromise = runtime.execute(session, { instruction: "summarize the diff", output: "text" });
     await vi.waitFor(() => expect(calls).toHaveLength(1));
-    const [path, args, opts] = calls[0];
-    expect(path).toContain("opencode");
+    const [binaryPath, args, opts] = calls[0];
+    expect(binaryPath).toContain("opencode");
     // argv array — no shell interpolation ever.
     expect(opts.shell).toBe(false);
     expect(opts.cwd).toBe(workspace);
     expect(args.slice(0, 3)).toEqual(["run", "--format", "json"]);
+    expect(args).toContain("--print-logs");
     expect(args.join(" ")).toContain("summarize the diff");
+
+    // Per-session XDG roots must match the directories created at startSession;
+    // otherwise OpenCode ignores the generated config and Langfuse plugin.
+    const root = sessionRootFor(session);
+    expect(opts.env?.XDG_CONFIG_HOME).toBe(path.join(root, "config"));
+    expect(opts.env?.XDG_DATA_HOME).toBe(path.join(root, "data"));
+    expect(opts.env?.XDG_STATE_HOME).toBe(path.join(root, "state"));
 
     child.writeOut([stepStart, textEvent("The change looks fine."), stepFinish].join("\n") + "\n");
     child.close(0);
@@ -661,8 +753,7 @@ describe("execution observability", () => {
     expect(JSON.stringify(lines)).not.toContain("must not be logged");
   });
 
-  it("redacts secrets from streamed stderr", async () => {
-    process.env.MODEL_API_KEY = "sk-stderr-secret";
+  it("surfaces Langfuse plugin diagnostics from stderr at info", async () => {
     const child = new FakeChild();
     const { logger, lines } = makeCaptureLogger();
     const { runtime, calls } = makeRuntime(child, { logger });
@@ -670,7 +761,38 @@ describe("execution observability", () => {
     const resultPromise = runtime.execute(session, { instruction: "x", output: "text" });
     await vi.waitFor(() => expect(calls).toHaveLength(1));
 
-    child.stderr.emit("data", Buffer.from("fatal: api key sk-stderr-secret rejected\n"));
+    child.stderr.emit(
+      "data",
+      Buffer.from("[Langfuse tracing disabled] Missing Langfuse credentials\n"),
+    );
+    child.close(0);
+    await expect(resultPromise).rejects.toMatchObject({ code: "invalid_output" });
+
+    const tracingLine = lines.find((l) => l.obj.event_type === "tracing");
+    expect(tracingLine).toMatchObject({
+      level: "info",
+      msg: "agent tracing output",
+      obj: {
+        stream: "stderr",
+        summary: expect.stringContaining("Missing Langfuse credentials"),
+      },
+    });
+  });
+
+  it("redacts secrets (including the Langfuse secret key) from streamed stderr", async () => {
+    process.env.MODEL_API_KEY = "sk-stderr-secret";
+    process.env.LANGFUSE_SECRET_KEY = "sk-lf-stderr-secret";
+    const child = new FakeChild();
+    const { logger, lines } = makeCaptureLogger();
+    const { runtime, calls } = makeRuntime(child, { logger });
+    const { session } = await startedSession(runtime);
+    const resultPromise = runtime.execute(session, { instruction: "x", output: "text" });
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+
+    child.stderr.emit(
+      "data",
+      Buffer.from("fatal: api key sk-stderr-secret rejected; langfuse sk-lf-stderr-secret\n"),
+    );
     child.close(1);
     await expect(resultPromise).rejects.toMatchObject({ code: "crash" });
 
@@ -679,8 +801,10 @@ describe("execution observability", () => {
     );
     expect(stderrLine).toMatchObject({ level: "warn" });
     expect(JSON.stringify(stderrLine)).not.toContain("sk-stderr-secret");
+    expect(JSON.stringify(stderrLine)).not.toContain("sk-lf-stderr-secret");
     expect(JSON.stringify(stderrLine)).toContain("[redacted]");
     delete process.env.MODEL_API_KEY;
+    delete process.env.LANGFUSE_SECRET_KEY;
   });
 
   it("reports a timeout before killing the child", async () => {

@@ -86,10 +86,17 @@ token usage) is delegated to the
 [Langfuse OpenCode plugin](https://langfuse.com/integrations/developer-tools/opencode),
 not reimplemented in this application. The worker only:
 
-1. enables the pinned plugin in the generated per-session `opencode.json`
-   when `observability.langfuse.enabled` is `true` (config/review.json —
+1. enables the pinned plugin in the generated per-session
+   `$XDG_CONFIG_HOME/opencode/opencode.json` when
+   `observability.langfuse.enabled` is `true` (config/review.json —
    **disabled by default**), and
 2. forwards the Langfuse credentials to the isolated OpenCode child process.
+
+> OpenCode 2 resolves its global config from
+> `$XDG_CONFIG_HOME/opencode/opencode.json`. A file at
+> `$XDG_CONFIG_HOME/opencode.json` is ignored **without any error**, so the
+> plugin (and the custom model provider) silently never load. Keep the extra
+> `opencode/` directory level.
 
 Set these in `deploy/.env` (or the Dokploy environment tab) before enabling:
 
@@ -120,9 +127,12 @@ processes receive nothing outside their allowlist.
 > application, and secrets must never be placed in `config/review.json`.
 
 Set the credentials **before** enabling tracing: the plugin is loaded into
-every review session, and missing credentials mean traces are silently lost.
-Tracing export failures must never be treated as review failures, but a
-misconfigured/absent plugin package should be caught in a staging review
+every review session, and missing credentials mean no traces are exported.
+The runtime passes `--print-logs` and promotes plugin/tracing lines to
+`event_type: "tracing"` at info level, so `loading plugin` and
+`[Langfuse tracing disabled] Missing Langfuse credentials` are visible in the
+worker log. Tracing export failures must never be treated as review failures,
+but a misconfigured/absent plugin package should be caught in a staging review
 before production rollout.
 
 Tracing requires **OpenCode ≥ 2.2.6**: v2.2.5 silently ignores the configured
@@ -150,6 +160,11 @@ Troubleshooting a missing trace:
    Expect `opencode-observability-plugin@0.7.0`.
 3. Confirm the worker log shows `agentTracing` with the pinned package in
    `agent_session_created`.
+4. Confirm the plugin actually loaded: the worker log should contain an
+   `agent tracing output` line with `loading plugin id=@langfuse/...`. If it
+   says `[Langfuse tracing disabled] Missing Langfuse credentials`, the child
+   process did not receive the keys. If neither line appears, verify the
+   generated config is at `.../config/opencode/opencode.json` (see above).
 
 ## 4. First deployment
 
