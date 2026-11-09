@@ -3,8 +3,9 @@
 This document describes the production deployment of the AI PR Reviewer via
 Docker Compose, and how to run the same stack on [Dokploy](https://dokploy.com).
 It covers architecture, prerequisites, secrets, first deployment, upgrades,
-backup/restore (tested — evidence below), restart recovery, and the
-validation runbook (§10.4 of `docs/architecture.md`).
+backup/restore (tested — evidence below), restart recovery, an optional
+Dozzle log-viewer stack, and the validation runbook (§10.4 of
+`docs/architecture.md`).
 
 Related: `docs/architecture.md` §17 (deployment topology), §18 (ops),
 §25 (DoD).
@@ -258,28 +259,45 @@ operations tool, not an application dependency:
   service in the same Dokploy project) — not in another container, VM or
   server.
 
-### 10.1 Setup
+### 10.1 Deploy on Dokploy
 
-1. **Generate credentials** (one-time, on any machine with Docker; the file
-   is gitignored and must never be committed):
+Add a **second Compose service** in the same Dokploy project and point it at
+exactly this file (do **not** include the local override):
+
+| Setting | Value |
+|---|---|
+| Compose file | `deploy/docker-compose.dozzle.yml` |
+| Service | `dozzle` |
+| Domain → Container Port | `8080` |
+| Environment | `DOZZLE_USERS_FILE=/etc/dozzle/users.yml` |
+
+The file declares the project name `ai-pr-reviewer-logs`, joins the external
+`dokploy-network`, and publishes no host ports.
+
+1. **Generate credentials** on the Dokploy host, outside the repo checkout
+   (Dokploy re-clones the checkout on redeploy, so anything inside it is
+   disposable):
 
    ```sh
-   mkdir -p deploy/dozzle
-   docker run -it --rm amir20/dozzle:v11.4.1 generate admin \
+   sudo mkdir -p /etc/dozzle
+   sudo docker run -it --rm amir20/dozzle:v11.4.1 generate admin \
      --email ops@yourdomain.com --name "Ops Admin" \
-     > deploy/dozzle/users.yml
+     > /etc/dozzle/users.yml
+   sudo chmod 600 /etc/dozzle/users.yml
    ```
 
    Omit `--password` to be prompted on stdin. Dozzle v11 uses the `simple`
    auth provider reading `/data/users.yml` (bcrypt hashes) — the old
-   `DOZZLE_USER_*` env vars no longer exist. Without `users.yml` the login
-   fails closed: there is no anonymous access.
+   `DOZZLE_USER_*` env vars no longer exist. Without the file, login fails
+   closed: there is no anonymous access.
 
-   On Dokploy the checkout is re-cloned on redeploy, so the in-repo
-   `deploy/dozzle/users.yml` default can be wiped. Generate the file once at
-   a persistent host path (e.g. `/etc/dozzle/users.yml`) and set
-   `DOZZLE_USERS_FILE=/etc/dozzle/users.yml` for the Compose service.
-2. **Deploy**: create a second *Compose* service in Dokploy pointing at
+   Set `DOZZLE_USERS_FILE=/etc/dozzle/users.yml` on the Compose service. The
+   path must point at an existing **file** before deploy: if it is missing,
+   Docker creates a *directory* there and the bind mount breaks login.
+
+   For a local run you can omit `DOZZLE_USERS_FILE`; the default is
+   `deploy/dozzle/users.yml` (gitignored).
+2. **Deploy**: create the service pointing at
    `deploy/docker-compose.dozzle.yml`, and attach a domain (e.g.
    `logs.yourdomain.com`) to the `dozzle` service with **Container Port
    `8080`**. Traefik terminates TLS and routes over `dokploy-network`; no
@@ -290,15 +308,20 @@ operations tool, not an application dependency:
    - **username** — the first argument to the `generate` command above
      (`admin` in the example),
    - **password** — the value typed at the `--password` prompt.
-   
+
    `users.yml` stores only bcrypt hashes, so a forgotten password cannot be
-   recovered. Regenerate the entry (rerun `generate`) and redeploy/restart.
+   recovered. Regenerate the entry (rerun `generate`) and restart/redeploy.
    To add another user, run `generate <username>` again and append its block
    to the same `users.yml`.
 4. **Verify**: after logging in, confirm the `ai-pr-reviewer-*` containers
    appear in the list.
 
-Local smoke run without Dokploy/Traefik (localhost-only binding):
+Dozzle's own state (session secret, saved settings) lives in the
+`dozzle-data` named volume mounted at `/data`, so logins survive container
+recreation; `users.yml` is bind-mounted read-only on top of it.
+
+Local smoke run without Dokploy/Traefik (localhost-only binding, Compose
+creates a local network):
 
 ```sh
 docker compose \
@@ -348,3 +371,8 @@ Scenarios from architecture §10.4, with local verification status:
 8. **Config rollback** — `config/review.json` is baked into the image;
    validate with the schema (`config/schemas`) before deploy; rollback =
    redeploy previous image. *Rollback drill is user-environment.*
+9. **Dozzle smoke (local override)** — verified: container `healthy`,
+   `/healthcheck` returns 200, unauthenticated `/` redirects to `/login`,
+   login with generated credentials returns 200 (wrong password 401), and
+   `down` leaves no containers or networks behind. *Dokploy/Traefik ingress
+   and `/etc/dozzle/users.yml` are user-environment steps (§10).*

@@ -48,6 +48,9 @@ services:
     # The one mount the whole point of Dozzle depends on. Read-only on disk.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Persistent Dozzle state (session secret + saved settings) so logins
+      # survive container recreation. Dozzle writes this to /data.
+      - dozzle-data:/data
       # Generated locally (see header); deploy/dozzle/users.yml is gitignored.
       # On Dokploy the repo checkout is re-cloned on redeploy, so that in-repo
       # default can be wiped — point DOZZLE_USERS_FILE at a persistent host
@@ -88,6 +91,11 @@ services:
         limits:
           cpus: "0.5"
           memory: 256M
+
+volumes:
+  # Session secret + Dozzle settings. Not the users file (that is a bind
+  # mount below so operators own it).
+  dozzle-data:
 
 networks:
   # Public edge (Dokploy HTTPS ingress). Same external network the main
