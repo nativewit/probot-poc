@@ -20,4 +20,7 @@ tsconfig.tsbuildinfo
 # Production deployment secrets (ticket 13) — never commit
 deploy/.env
 deploy/secrets/*
-deploy/dozzle/users.yml
+# Dozzle's /data directory: users.yml plus generated session secret/settings.
+# The .gitkeep keeps the mount-source directory present in a fresh checkout.
+deploy/dozzle/*
+!deploy/dozzle/.gitkeep

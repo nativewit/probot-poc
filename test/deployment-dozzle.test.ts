@@ -33,10 +33,14 @@ describe("dozzle compose structure (operations stack)", () => {
     expect(compose.services.dozzle.image).toBe("amir20/dozzle:v11.4.1");
   });
 
-  it("mounts the Docker socket READ-ONLY, plus the generated users.yml", () => {
+  it("mounts the Docker socket READ-ONLY and a host DATA DIRECTORY at /data", () => {
     const mounts = compose.services.dozzle.volumes as string[];
     expect(mounts).toContain("/var/run/docker.sock:/var/run/docker.sock:ro");
-    expect(mounts.some((m) => m.endsWith(":/data/users.yml:ro"))).toBe(true);
+    expect(mounts.some((m) => m.endsWith(":/data"))).toBe(true);
+    // Regression: never bind-mount users.yml as a single file. If the host
+    // file is missing, Docker creates a directory and Dozzle crash-loops
+    // with "read /data/users.yml: is a directory".
+    expect(mounts.some((m) => m.includes("/data/users.yml"))).toBe(false);
   });
 
   it("publishes NO host ports (expose 8080 for the Traefik ingress)", () => {

@@ -269,10 +269,12 @@ exactly this file (do **not** include the local override):
 | Compose file | `deploy/docker-compose.dozzle.yml` |
 | Service | `dozzle` |
 | Domain → Container Port | `8080` |
-| Environment | `DOZZLE_USERS_FILE=/etc/dozzle/users.yml` |
+| Environment | `DOZZLE_DATA_DIR=/etc/dozzle` |
 
 The file declares the project name `ai-pr-reviewer-logs`, joins the external
-`dokploy-network`, and publishes no host ports.
+`dokploy-network`, and publishes no host ports. `DOZZLE_DATA_DIR` is the host
+**directory** mounted at `/data`; it must contain `users.yml` and also holds
+Dozzle's session secret/settings.
 
 1. **Generate credentials** on the Dokploy host, outside the repo checkout
    (Dokploy re-clones the checkout on redeploy, so anything inside it is
@@ -291,17 +293,17 @@ The file declares the project name `ai-pr-reviewer-logs`, joins the external
    `DOZZLE_USER_*` env vars no longer exist. Without the file, login fails
    closed: there is no anonymous access.
 
-   Set `DOZZLE_USERS_FILE=/etc/dozzle/users.yml` on the Compose service. The
-   path must point at an existing **file** before deploy: if it is missing,
-   Docker creates a *directory* there and the bind mount breaks login.
+   Set `DOZZLE_DATA_DIR=/etc/dozzle` on the Compose service. Mount the
+   directory, **not** the file: if a single-file bind source is missing,
+   Docker creates it as a directory and Dozzle crash-loops with
+   `read /data/users.yml: is a directory`. If that has already happened,
+   delete the directory (`sudo rm -rf /etc/dozzle/users.yml`) and regenerate
+   the file.
 
-   For a local run you can omit `DOZZLE_USERS_FILE`; the default is
-   `deploy/dozzle/users.yml` (gitignored).
+   For a local run you can omit `DOZZLE_DATA_DIR`; the default is the
+   `deploy/dozzle/` directory (gitignored, `.gitkeep` tracked).
 2. **Deploy**: create the service pointing at
-   `deploy/docker-compose.dozzle.yml`, and attach a domain (e.g.
-   `logs.yourdomain.com`) to the `dozzle` service with **Container Port
-   `8080`**. Traefik terminates TLS and routes over `dokploy-network`; no
-   host port is published (matches the main stack's invariant).
+   `deploy/docker-compose.dozzle.yml` and attach a domain (see §10.2).
 3. **Log in**: browse to the domain (e.g. `https://logs.yourdomain.com`) or,
    for a local smoke run, `http://127.0.0.1:8080`. Dozzle redirects to
    `/login`; sign in with:
@@ -316,9 +318,32 @@ The file declares the project name `ai-pr-reviewer-logs`, joins the external
 4. **Verify**: after logging in, confirm the `ai-pr-reviewer-*` containers
    appear in the list.
 
-Dozzle's own state (session secret, saved settings) lives in the
-`dozzle-data` named volume mounted at `/data`, so logins survive container
-recreation; `users.yml` is bind-mounted read-only on top of it.
+Dozzle's own state (session secret, saved settings) lives in the same host
+directory, so logins survive container recreation and redeploys (as long as
+`DOZZLE_DATA_DIR` points outside the re-cloned checkout).
+
+### 10.2 Domain and Traefik (custom or Dokploy free domain)
+
+A custom domain is **not required** — Dokploy can generate a free hostname
+for the service.
+
+- **Dokploy free domain**: open the Dozzle service → **Domains** → use
+  **Generate Domain** (Dokploy's `*.sslip.io`-style hostname). It resolves to
+  the server IP automatically, and Dokploy configures the Traefik router and
+  HTTPS certificate. No DNS records are needed.
+- **Custom domain**: point an `A` record at the Dokploy host, then add it in
+  the same **Domains** tab.
+- For either option set:
+  - **Service**: `dozzle`
+  - **Container Port**: `8080`
+  - **Path**: `/`
+  - **HTTPS**: enabled (Let's Encrypt via Traefik)
+
+Requirements on the host: ports `80`/`443` reachable, Dokploy's Traefik
+running (default), and the service on `dokploy-network` (the compose file
+does this). Do **not** add Traefik labels manually — Dokploy injects them at
+deploy time. The stack publishes no host port, so the only ingress path is
+Traefik.
 
 Local smoke run without Dokploy/Traefik (localhost-only binding, Compose
 creates a local network):
@@ -330,7 +355,7 @@ docker compose \
   up -d   # http://127.0.0.1:8080
 ```
 
-### 10.2 Security posture and caveats
+### 10.3 Security posture and caveats
 
 - **The Docker socket is root-equivalent on the host.** A read-only mount
   (`:ro`) restricts the file on disk, **not** the Docker API — the container
@@ -375,4 +400,4 @@ Scenarios from architecture §10.4, with local verification status:
    `/healthcheck` returns 200, unauthenticated `/` redirects to `/login`,
    login with generated credentials returns 200 (wrong password 401), and
    `down` leaves no containers or networks behind. *Dokploy/Traefik ingress
-   and `/etc/dozzle/users.yml` are user-environment steps (§10).*
+   and `/etc/dozzle` are user-environment steps (§10).*
