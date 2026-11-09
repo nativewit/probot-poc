@@ -41,7 +41,6 @@ export interface ReviewCommentParams {
   path: string;
   line: number;
   side?: "RIGHT" | "LEFT";
-  subject_type?: "LINE" | "FILE";
   body: string;
 }
 

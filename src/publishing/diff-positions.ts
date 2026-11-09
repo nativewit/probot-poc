@@ -150,7 +150,6 @@ export interface InlinePosition {
   path: string;
   line: number;
   side: "RIGHT";
-  subject_type: "LINE";
 }
 
 export type InlineResolution =
@@ -172,7 +171,7 @@ export function resolveInlinePosition(
   if (file.isBinary) return { kind: "binary_file" };
   if (file.isDeletedFile) return { kind: "deleted_file" };
   if (newSideLines(file).has(line)) {
-    return { kind: "anchored", position: { path: filePath, line, side: "RIGHT", subject_type: "LINE" } };
+    return { kind: "anchored", position: { path: filePath, line, side: "RIGHT" } };
   }
   // The line exists only on the old side (deleted) or outside every hunk.
   if (oldSideLines(file).has(line)) return { kind: "deleted_line" };

@@ -456,7 +456,7 @@ describe("diff position resolution (§7.4)", () => {
     // New side: added + context lines (1, 2, 3, 4, 5).
     expect(resolveInlinePosition(diffFiles, "src/app.js", 4)).toEqual({
       kind: "anchored",
-      position: { path: "src/app.js", line: 4, side: "RIGHT", subject_type: "LINE" },
+      position: { path: "src/app.js", line: 4, side: "RIGHT" },
     });
   });
 
@@ -476,7 +476,7 @@ describe("diff position resolution (§7.4)", () => {
     expect(file.isNewFile).toBe(true);
     expect(resolveInlinePosition(files, "src/new.js", 2)).toEqual({
       kind: "anchored",
-      position: { path: "src/new.js", line: 2, side: "RIGHT", subject_type: "LINE" },
+      position: { path: "src/new.js", line: 2, side: "RIGHT" },
     });
   });
 
@@ -662,7 +662,7 @@ describe("publishReview (fake octokit + Postgres)", () => {
     expect(call.body).toContain("Stored issue");
     expect(call.body).toContain("ai-pr-reviewer:summary");
     expect(call.comments).toHaveLength(1);
-    expect(call.comments[0]).toMatchObject({ path: "src/app.js", line: 4, side: "RIGHT", subject_type: "LINE" });
+    expect(call.comments[0]).toMatchObject({ path: "src/app.js", line: 4, side: "RIGHT" });
     expect(extractFingerprint(call.comments[0].body)).toBe(anchored.fingerprint);
 
     // §13.1: publication rows are persisted with the GitHub ids.
