@@ -71,7 +71,22 @@ RUN mkdir -p /app/workspaces && chown node:node /app/workspaces
 COPY --chown=node:node config ./config
 
 # Run as non-root.
+#
+# Keep HOME stable and writable: the OpenCode plugin cache lives under
+# $HOME/.cache/opencode, and the worker forwards HOME to the isolated agent
+# child process (XDG_CONFIG_HOME/XDG_DATA_HOME are per-session).
+ENV HOME=/home/node
 USER node
+
+# Pre-install the agent-tracing plugin at build time. `opencode run` does NOT
+# install a missing package plugin itself (only a long-running server does, in
+# the background), and every review uses a fresh per-session config/data dir.
+# Without this cache the `plugins` entry in the session config is silently
+# ignored and no traces are exported. Bump the pin deliberately.
+ARG LANGFUSE_PLUGIN=@langfuse/opencode-observability-plugin@0.7.0
+RUN mkdir -p /home/node/.config/opencode && \
+    opencode plugin add "${LANGFUSE_PLUGIN}" && \
+    opencode plugin list
 
 # Default: Probot application. Override with `node lib/worker.js` for the
 # review worker container. Invoking node directly (not npm) makes the node

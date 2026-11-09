@@ -125,6 +125,24 @@ Tracing export failures must never be treated as review failures, but a
 misconfigured/absent plugin package should be caught in a staging review
 before production rollout.
 
+The plugin package is **pre-installed at image build time**
+(`opencode plugin add` in the `Dockerfile`). This is required: `opencode run`
+does not install a missing package plugin by itself, and every review uses an
+isolated per-session `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; only a long-running
+OpenCode server installs missing plugins (in the background). The package is
+cached under the worker user's `$HOME/.cache/opencode`. If you change the
+pinned plugin version, rebuild the image so the cache matches.
+
+Troubleshooting a missing trace:
+
+1. Confirm the credentials are in the **worker container** (not only in your
+   shell): `docker compose exec worker env | grep -c '^LANGFUSE_'` (expect 3+).
+2. Confirm the cache exists in the image:
+   `docker compose exec worker opencode plugin list` (expect the pinned
+   package).
+3. Confirm the worker log shows `agentTracing` with the pinned package in
+   `agent_session_created`.
+
 ## 4. First deployment
 
 ```sh
