@@ -323,26 +323,41 @@ docker compose \
 
 ### 10.2 Domain and Traefik (custom or Dokploy free domain)
 
-A custom domain is **not required** — Dokploy can generate a free hostname
-for the service.
+A custom domain is **not required** — you can use a DNS-free
+`sslip.io` name whose text contains the public IP of the Dokploy host.
 
-- **Dokploy free domain**: open the Dozzle service → **Domains** → use
-  **Generate Domain** (Dokploy's `*.sslip.io`-style hostname). It resolves to
-  the server IP automatically, and Dokploy configures the Traefik router and
-  HTTPS certificate. No DNS records are needed.
-- **Custom domain**: point an `A` record at the Dokploy host, then add it in
-  the same **Domains** tab.
-- For either option set:
+- **Free `sslip.io` domain (manual, recommended)**: in the Dozzle service →
+  **Domains**, *type* a hostname of the form
+  `<prefix>.<public-ip-with-dashes>.sslip.io`, e.g.
+  `dozzle.106-51-174-82.sslip.io` for public IP `106.51.174.82`. sslip.io
+  answers with the embedded IP, so no DNS records are needed. Set:
   - **Service**: `dozzle`
   - **Container Port**: `8080`
   - **Path**: `/`
   - **HTTPS**: enabled (Let's Encrypt via Traefik)
+- **Dokploy "Generate Domain"**: only use it if it produces a name containing
+  an IP (e.g. `...-106-51-174-82.sslip.io`). On hosts where Dokploy cannot
+  detect the public IP (VMs with shared/NAT networking, custom hostnames) it
+  falls back to the machine hostname and generates names such as
+  `...-omarchy-local.sslip.io`. Those contain **no IP**, so sslip.io returns
+  NXDOMAIN and the URL never loads. Type the domain manually instead.
+- **Custom domain**: point an `A` record at the public IP, then add it in the
+  same **Domains** tab.
 
-Requirements on the host: ports `80`/`443` reachable, Dokploy's Traefik
-running (default), and the service on `dokploy-network` (the compose file
-does this). Do **not** add Traefik labels manually — Dokploy injects them at
-deploy time. The stack publishes no host port, so the only ingress path is
-Traefik.
+Requirements on the host: ports `80`/`443` reachable from the internet,
+Dokploy's Traefik running (default), and the service on `dokploy-network` (the
+compose file does this). If the Dokploy VM uses shared/NAT networking, forward
+host ports `80` and `443` to the VM (e.g. in UTM/OrbStack/libvirt network
+settings); otherwise even a valid sslip.io name cannot reach Traefik. Do
+**not** add Traefik labels manually — Dokploy injects them at deploy time. The
+stack publishes no host port, so the only ingress path is Traefik.
+
+Quick external check (from anywhere):
+
+```sh
+dig +short dozzle.106-51-174-82.sslip.io   # must print the public IP
+curl -I https://dozzle.106-51-174-82.sslip.io
+```
 
 Local smoke run without Dokploy/Traefik (localhost-only binding, Compose
 creates a local network):
@@ -386,6 +401,12 @@ docker compose \
 - **Login rejected after changing `DOZZLE_ADMIN_PASSWORD`** — the init leaves
   an existing `users.yml` untouched. Set `DOZZLE_FORCE_USERS=1`, redeploy,
   then unset it.
+- **Domain does not resolve (`Could not resolve host`, NXDOMAIN)** — a
+  Dokploy-generated name ending in a machine hostname
+  (`...-omarchy-local.sslip.io`) contains no embedded IP, so sslip.io returns
+  nothing. Delete it and add a domain manually containing the public IP
+  (`dozzle.<ip-with-dashes>.sslip.io`); see §10.2. Also confirm ports
+  `80`/`443` are forwarded to the VM when its network is shared/NAT.
 - **`read /data/users.yml: is a directory`** — this came from bind-mounting a
   single file that did not exist. The stack now uses the `dozzle-data` named
   volume instead; if you customised the mounts, mount a directory (or the
