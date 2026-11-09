@@ -137,9 +137,13 @@ Troubleshooting a missing trace:
 
 1. Confirm the credentials are in the **worker container** (not only in your
    shell): `docker compose exec worker env | grep -c '^LANGFUSE_'` (expect 3+).
-2. Confirm the cache exists in the image:
-   `docker compose exec worker opencode plugin list` (expect the pinned
-   package).
+2. Confirm the plugin cache exists in the container (do **not** rely on
+   `opencode plugin list`, which queries a server and may print
+   "No plugins found" even when the cache is present):
+   ```sh
+   docker compose exec worker sh -lc 'ls ~/.cache/opencode/npm/@langfuse'
+   ```
+   Expect `opencode-observability-plugin@0.7.0`.
 3. Confirm the worker log shows `agentTracing` with the pinned package in
    `agent_session_created`.
 

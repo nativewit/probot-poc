@@ -86,7 +86,7 @@ USER node
 ARG LANGFUSE_PLUGIN=@langfuse/opencode-observability-plugin@0.7.0
 RUN mkdir -p /home/node/.config/opencode && \
     opencode plugin add "${LANGFUSE_PLUGIN}" && \
-    opencode plugin list
+    test -d /home/node/.cache/opencode/npm/@langfuse
 
 # Default: Probot application. Override with `node lib/worker.js` for the
 # review worker container. Invoking node directly (not npm) makes the node
