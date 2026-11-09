@@ -31,10 +31,30 @@ const compose = parse(readFileSync(composePath, "utf8"), { merge: true }) as {
 const MAIN_COMPOSE_PATH = path.resolve(__dirname, "../deploy/docker-compose.yml");
 
 describe("dozzle compose structure (operations stack)", () => {
-  it("contains only the dozzle service plus its auth init (separate project)", () => {
-    expect(Object.keys(compose.services).sort()).toEqual(["dozzle", "dozzle-init"]);
+  it("contains only the dozzle service, its auth init and the optional tunnel", () => {
+    expect(Object.keys(compose.services).sort()).toEqual([
+      "dozzle",
+      "dozzle-init",
+      "dozzle-tunnel",
+    ]);
     expect(compose.services.dozzle.image).toBe("amir20/dozzle:v11.4.1");
     expect(compose.services["dozzle-init"].image).toBe("amir20/dozzle:v11.4.1-alpine");
+  });
+
+  it("publishes Dozzle through an outbound-only Cloudflare quick tunnel (CGNAT)", () => {
+    const tunnel = compose.services["dozzle-tunnel"];
+    expect(tunnel.image).toBe("cloudflare/cloudflared:2026.10.7");
+    expect(tunnel.command).toEqual([
+      "tunnel",
+      "--no-autoupdate",
+      "--url",
+      "http://dozzle:8080",
+    ]);
+    expect(tunnel.networks).toEqual(["edge"]);
+    expect(tunnel.depends_on.dozzle.condition).toBe("service_healthy");
+    // A tunnel needs no inbound port and must never bind one on the host.
+    expect("ports" in tunnel).toBe(false);
+    expect(tunnel.expose).toBeUndefined();
   });
 
   it("mounts the Docker socket READ-ONLY and shared state as a named volume", () => {

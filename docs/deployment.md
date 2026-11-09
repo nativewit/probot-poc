@@ -272,11 +272,13 @@ exactly this file (do **not** include the local override):
 | Environment | `DOZZLE_ADMIN_PASSWORD` (required) |
 
 The file declares the project name `ai-pr-reviewer-logs`, joins the external
-`dokploy-network`, and publishes no host ports. It contains two services:
+`dokploy-network`, and publishes no host ports. It contains three services:
 
 - `dozzle-init` — a one-shot that generates `/data/users.yml` (bcrypt) from
   environment variables into the `dozzle-data` volume and exits.
 - `dozzle` — starts only after the init succeeds.
+- `dozzle-tunnel` — an outbound Cloudflare quick tunnel for hosts that cannot
+  accept inbound connections (see §10.2). Remove it if you have a public IP.
 
 **No host-side file creation or shell access is needed** — everything is
 driven from Compose environment variables, so it works from the Dokploy UI.
@@ -358,6 +360,30 @@ Quick external check (from anywhere):
 dig +short dozzle.106-51-174-82.sslip.io   # must print the public IP
 curl -I https://dozzle.106-51-174-82.sslip.io
 ```
+
+#### Behind CGNAT (no public IPv4 on the router)
+
+Many ISPs put the router behind carrier-grade NAT: the router's WAN address is
+private (e.g. `10.x.x.x` / `100.64.x.x`), while the internet sees a shared
+public IP. Port forwarding cannot cross that second NAT, so no domain —
+`sslip.io` or custom — can reach the stack. Confirm it by checking the router's
+WAN IP in its admin UI and comparing it with `curl https://api.ipify.org`; if
+they differ, you are behind CGNAT.
+
+Use the bundled outbound tunnel instead. `dozzle-tunnel` dials Cloudflare
+(TCP/UDP 7844 outbound), so it needs no port forwarding:
+
+```sh
+docker logs ai-pr-reviewer-logs-dozzle-tunnel-1 2>&1 | grep -i trycloudflare
+# https://<random-words>.trycloudflare.com
+```
+
+Open that URL and log in with `admin` / `DOZZLE_ADMIN_PASSWORD`. The hostname
+is random and changes whenever the tunnel container is recreated; it is meant
+for demos/operations, not a stable production endpoint. To disable public
+access, delete the `dozzle-tunnel` service from the compose file and redeploy.
+Alternatively ask the ISP for a public/static IPv4, or use a named Cloudflare
+tunnel with a domain you own for a stable hostname.
 
 Local smoke run without Dokploy/Traefik (localhost-only binding, Compose
 creates a local network):

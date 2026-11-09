@@ -30,11 +30,22 @@
 # users.yml lives in the `dozzle-data` named volume, which survives redeploys.
 # The generated file contains bcrypt hashes, never plaintext.
 #
-# Ingress: no host port is published. In Dokploy, add a second *Compose*
-# service pointing at this file and attach a domain (e.g. logs.yourdomain.com
-# or Dokploy's generated free domain) to the `dozzle` service with Container
-# Port `8080`; Traefik terminates TLS and routes over dokploy-network.
-# Restrict the domain to admin IPs/VPN where possible.
+# Ingress: no host port is published. In Dokploy, attach a domain (e.g.
+# logs.yourdomain.com or an sslip.io name containing the public IP) to the
+# `dozzle` service with Container Port `8080`; Traefik terminates TLS and
+# routes over dokploy-network. Restrict the domain to admin IPs/VPN where
+# possible.
+#
+# Behind CGNAT (ISP does not give the router a public IPv4) inbound port
+# forwarding is impossible. For that case the optional `dozzle-tunnel`
+# service opens an OUTBOUND Cloudflare quick tunnel and publishes Dozzle at
+# a random https://<name>.trycloudflare.com URL. Read it from the service
+# logs after deploy:
+#
+#   docker logs ai-pr-reviewer-logs-dozzle-tunnel-1 | grep trycloudflare
+#
+# The tunnel URL changes whenever the container is recreated. Remove the
+# service if you have a real public IP or do not want public exposure.
 # Local smoke (no Dokploy): use docker-compose.dozzle.local.yml.
 #
 # Validate: docker compose -f deploy/docker-compose.dozzle.yml config
@@ -126,6 +137,31 @@ services:
         limits:
           cpus: "0.5"
           memory: 256M
+
+  # Optional public ingress for CGNAT / no-port-forwarding environments.
+  # cloudflared dials OUT to Cloudflare, so it needs no inbound ports and
+  # bypasses the ISP NAT. Quick tunnels get a random *.trycloudflare.com
+  # hostname (printed in the logs) and are intended for demos/ops access,
+  # not as a stable production URL. Dozzle auth is still required.
+  dozzle-tunnel:
+    image: cloudflare/cloudflared:2026.10.7
+    restart: unless-stopped
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --url
+      - http://dozzle:8080
+    depends_on:
+      dozzle:
+        condition: service_healthy
+    # Same edge network as dozzle; Docker DNS resolves the service name.
+    networks:
+      - edge
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
 
 volumes:
   # Dozzle state: users.yml (bcrypt hashes), session secret and settings.
