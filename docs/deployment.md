@@ -372,6 +372,33 @@ docker compose \
   and point Dozzle at `DOCKER_HOST=tcp://socket-proxy:2375` instead of
   mounting the socket directly.
 
+### 10.4 Troubleshooting
+
+Both of these crash-loop with `level":"fatal"` in `docker logs`:
+
+- **`read /data/users.yml: is a directory`** — `DOZZLE_DATA_DIR` pointed at a
+  path that did not exist as a file, so Docker created a directory. Use a
+  directory mount (the compose file already does); remove the stray
+  directory and regenerate the file.
+- **`No users.yaml or users.yml file found.`** — the directory mounted at
+  `/data` exists but is empty (commonly the repo's `deploy/dozzle/`, because
+  `DOZZLE_DATA_DIR` was not set on the Dokploy service). Find the actual
+  host directory that was mounted:
+
+  ```sh
+  docker ps --filter name=dozzle
+  docker inspect ai-pr-reviewer-logs-dozzle-1 \
+    --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+  ls -la /etc/dozzle
+  ```
+
+  Then either put `users.yml` into the directory that `/data` is bound to, or
+  set `DOZZLE_DATA_DIR` on the Compose service to the directory containing
+  it and redeploy. Remember: changing the env var does nothing until the
+  service is redeployed.
+
+`users.yml` must be a regular file (`-rw-------`), never a directory.
+
 ## 11. Validation runbook
 
 Scenarios from architecture §10.4, with local verification status:
