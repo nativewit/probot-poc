@@ -599,6 +599,36 @@ describe("execution observability", () => {
     delete process.env.MODEL_API_KEY;
   });
 
+  it("logs non-secret Langfuse diagnostics (presence only, never key values)", async () => {
+    process.env.LANGFUSE_PUBLIC_KEY = "pk-lf-secret-value";
+    process.env.LANGFUSE_SECRET_KEY = "sk-lf-secret-value";
+    process.env.LANGFUSE_BASE_URL = "https://langfuse.test";
+    const { logger, lines } = makeCaptureLogger();
+    const runtime = new OpenCodeAgentRuntime(
+      { ...baseConfig, observability: { langfuse: { enabled: true } } },
+      {
+        logger,
+        spawnImpl: makeSpawnStub(new FakeChild()).stub,
+        rmImpl: vi.fn(async () => undefined) as unknown as OpenCodeRuntimeOptions["rmImpl"],
+        gitStatusImpl: async () => undefined,
+      },
+    );
+    await runtime.startSession({ reviewId: "rev_trace", workspacePath: "/tmp/w" });
+
+    const sessionLog = lines.find((l) => l.obj.event === "agent_session_created");
+    expect(sessionLog?.obj.agentTracingStatus).toMatchObject({
+      publicKeyPresent: true,
+      secretKeyPresent: true,
+      baseUrl: "https://langfuse.test",
+    });
+    expect(JSON.stringify(lines)).not.toContain("pk-lf-secret-value");
+    expect(JSON.stringify(lines)).not.toContain("sk-lf-secret-value");
+
+    delete process.env.LANGFUSE_PUBLIC_KEY;
+    delete process.env.LANGFUSE_SECRET_KEY;
+    delete process.env.LANGFUSE_BASE_URL;
+  });
+
   it("streams child output: error events at warn, text content never logged", async () => {
     const child = new FakeChild();
     const { logger, lines } = makeCaptureLogger();

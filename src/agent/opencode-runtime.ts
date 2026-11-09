@@ -20,6 +20,7 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -197,6 +198,22 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
       agentTracing: this.config.observability?.langfuse?.enabled
         ? (this.config.observability.langfuse.plugin ?? DEFAULT_LANGFUSE_PLUGIN)
         : "off",
+      // Non-secret diagnostics: the plugin is silently inert when credentials
+      // are missing or the package cache was never populated, so make both
+      // visible without ever logging key values.
+      agentTracingStatus: this.config.observability?.langfuse?.enabled
+        ? {
+            publicKeyPresent: Boolean(process.env.LANGFUSE_PUBLIC_KEY),
+            secretKeyPresent: Boolean(process.env.LANGFUSE_SECRET_KEY),
+            baseUrl: process.env.LANGFUSE_BASE_URL
+              ? endpointLabel(process.env.LANGFUSE_BASE_URL)
+              : "default(cloud)",
+            environment: process.env.LANGFUSE_ENVIRONMENT ?? "default(development)",
+            pluginCachePresent: existsSync(
+              path.join(os.homedir(), ".cache", "opencode", "npm", "@langfuse"),
+            ),
+          }
+        : undefined,
     });
 
     return {
