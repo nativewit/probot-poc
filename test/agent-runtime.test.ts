@@ -104,6 +104,31 @@ function makeRuntime(child: FakeChild, overrides: Partial<OpenCodeRuntimeOptions
   return { runtime, calls, rmImpl };
 }
 
+interface CapturedLog {
+  level: "debug" | "info" | "warn" | "error";
+  msg: string;
+  obj: Record<string, unknown>;
+}
+
+/** Logger stub matching the runtime's `(msg, obj)` adapter surface. */
+function makeCaptureLogger() {
+  const lines: CapturedLog[] = [];
+  const push =
+    (level: CapturedLog["level"]) =>
+    (msg: string, obj?: unknown): void => {
+      lines.push({ level, msg, obj: (obj ?? {}) as Record<string, unknown> });
+    };
+  return {
+    lines,
+    logger: {
+      debug: push("debug"),
+      info: push("info"),
+      warn: push("warn"),
+      error: push("error"),
+    },
+  };
+}
+
 /** NDJSON helpers matching the probed real opencode `--format json` output. */
 const stepStart = JSON.stringify({ type: "step_start", part: { type: "step_start" } });
 const stepFinish = JSON.stringify({
@@ -179,6 +204,86 @@ describe("opencode config building", () => {
     expect(json).not.toContain("sk-");
     expect(json).toContain("{env:MODEL_API_KEY}");
     expect(json).toContain("llm.example.test/compat");
+    // Agent tracing is off by default — no plugin is loaded.
+    expect(json).not.toContain("langfuse");
+  });
+
+  it("enables the pinned Langfuse OpenCode plugin only when configured", () => {
+    const withTracing = buildSessionConfig({
+      sessionDir: "/tmp/s",
+      workspacePath: "/tmp/w",
+      config: {
+        ...baseConfig,
+        observability: { langfuse: { enabled: true } },
+      },
+      modelId: "workers-ai/@cf/zai-org/glm-4.7-flash",
+      maxOutputTokens: 4000,
+    });
+    expect(withTracing.plugins).toEqual(["@langfuse/opencode-observability-plugin@0.7.0"]);
+    // Credentials never appear in the config file.
+    expect(JSON.stringify(withTracing)).not.toMatch(/pk-lf-|sk-lf-/);
+
+    const custom = buildSessionConfig({
+      sessionDir: "/tmp/s",
+      workspacePath: "/tmp/w",
+      config: {
+        ...baseConfig,
+        observability: { langfuse: { enabled: true, plugin: "@langfuse/opencode-observability-plugin@9.9.9" } },
+      },
+      modelId: "workers-ai/@cf/zai-org/glm-4.7-flash",
+      maxOutputTokens: 4000,
+    });
+    expect(custom.plugins).toEqual(["@langfuse/opencode-observability-plugin@9.9.9"]);
+  });
+
+  it("passes review, repository and PR correlation as Langfuse trace tags", () => {
+    const traced = buildSessionConfig({
+      sessionDir: "/tmp/s",
+      workspacePath: "/tmp/w",
+      config: {
+        ...baseConfig,
+        observability: { langfuse: { enabled: true } },
+      },
+      modelId: "workers-ai/@cf/zai-org/glm-4.7-flash",
+      maxOutputTokens: 4000,
+      reviewId: "rev_42",
+      repository: "acme/widgets",
+      pullRequestNumber: 17,
+    });
+    expect(traced.plugins).toEqual([
+      {
+        package: "@langfuse/opencode-observability-plugin@0.7.0",
+        options: { tags: ["review:rev_42", "repository:acme/widgets", "pr:17"] },
+      },
+    ]);
+  });
+
+  it("forwards Langfuse credentials only when tracing is enabled, correlating the review", () => {
+    const env = buildChildEnv(
+      { ...baseConfig, observability: { langfuse: { enabled: true } } },
+      {
+        PATH: "/usr/bin",
+        LANGFUSE_PUBLIC_KEY: "pk-lf-test",
+        LANGFUSE_SECRET_KEY: "sk-lf-test",
+        LANGFUSE_BASE_URL: "https://langfuse.test",
+        LANGFUSE_ENVIRONMENT: "test",
+        LANGFUSE_USER_ID: "host-user",
+      },
+      { reviewId: "rev_42" },
+    );
+    expect(env.LANGFUSE_PUBLIC_KEY).toBe("pk-lf-test");
+    expect(env.LANGFUSE_SECRET_KEY).toBe("sk-lf-test");
+    expect(env.LANGFUSE_BASE_URL).toBe("https://langfuse.test");
+    expect(env.LANGFUSE_ENVIRONMENT).toBe("test");
+    // Thin correlation adapter: traces can be filtered back to the review.
+    expect(env.LANGFUSE_USER_ID).toBe("review:rev_42");
+
+    const disabled = buildChildEnv(baseConfig, {
+      LANGFUSE_PUBLIC_KEY: "pk-lf-test",
+      LANGFUSE_SECRET_KEY: "sk-lf-test",
+    });
+    expect(disabled.LANGFUSE_PUBLIC_KEY).toBeUndefined();
+    expect(disabled.LANGFUSE_SECRET_KEY).toBeUndefined();
   });
 
   it("resolveModelId prefers MODEL_NAME, falls back to provider.model", () => {
@@ -451,6 +556,161 @@ describe("execute: failure normalization", () => {
     expect(err.detail).not.toContain("sk-live-abcdef123456");
     expect(err.detail).toContain("[redacted]");
     delete process.env.MODEL_API_KEY;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Execution observability
+// ---------------------------------------------------------------------------
+
+describe("execution observability", () => {
+  it("logs session, spawn, exit and model identity without prompts or secrets", async () => {
+    process.env.MODEL_API_KEY = "sk-observability-secret";
+    const child = new FakeChild();
+    const { logger, lines } = makeCaptureLogger();
+    const { runtime, calls } = makeRuntime(child, { logger });
+    const { session } = await startedSession(runtime);
+
+    const resultPromise = runtime.execute(session, { instruction: "secret prompt contents", output: "text" });
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    child.writeOut([stepStart, textEvent("ok"), stepFinish].join("\n") + "\n");
+    child.close(0);
+    await resultPromise;
+
+    const sessionLog = lines.find((l) => l.obj.event === "agent_session_created");
+    expect(sessionLog).toMatchObject({
+      level: "info",
+      obj: { modelId: baseConfig.provider.model, providerType: "openai-compatible", apiKeyEnv: "MODEL_API_KEY" },
+    });
+    expect(JSON.stringify(sessionLog?.obj)).not.toContain("sk-observability-secret");
+
+    expect(lines.find((l) => l.obj.event === "agent_execute_started")).toMatchObject({
+      level: "info",
+      obj: { reviewId: "rev_test", outputMode: "text", instructionChars: 22 },
+    });
+    expect(lines.find((l) => l.obj.event === "agent_child_spawned")).toBeDefined();
+    expect(lines.find((l) => l.obj.event === "agent_execute_exited")).toMatchObject({
+      level: "info",
+      obj: { exitCode: 0, timedOut: false, outputTruncated: false },
+    });
+
+    // Prompts must never be logged.
+    expect(JSON.stringify(lines)).not.toContain("secret prompt contents");
+    delete process.env.MODEL_API_KEY;
+  });
+
+  it("streams child output: error events at warn, text content never logged", async () => {
+    const child = new FakeChild();
+    const { logger, lines } = makeCaptureLogger();
+    const { runtime, calls } = makeRuntime(child, { logger });
+    const { session } = await startedSession(runtime);
+    const resultPromise = runtime.execute(session, { instruction: "x", output: "text" });
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+
+    child.writeOut(
+      [
+        stepStart,
+        textEvent("this assistant text must not be logged"),
+        JSON.stringify({ type: "error", message: "Provider auth failed: invalid API key" }),
+      ].join("\n") + "\n",
+    );
+    child.close(0);
+    await expect(resultPromise).rejects.toMatchObject({ code: "provider_unavailable" });
+
+    const errorLine = lines.find(
+      (l) => l.obj.event === "agent_child_output" && l.obj.event_type === "error",
+    );
+    expect(errorLine).toMatchObject({
+      level: "warn",
+      obj: { summary: expect.stringContaining("Provider auth failed") },
+    });
+    const textLine = lines.find(
+      (l) => l.obj.event === "agent_child_output" && l.obj.event_type === "text",
+    );
+    expect(textLine?.obj.chars).toBeGreaterThan(0);
+    expect(JSON.stringify(lines)).not.toContain("must not be logged");
+  });
+
+  it("redacts secrets from streamed stderr", async () => {
+    process.env.MODEL_API_KEY = "sk-stderr-secret";
+    const child = new FakeChild();
+    const { logger, lines } = makeCaptureLogger();
+    const { runtime, calls } = makeRuntime(child, { logger });
+    const { session } = await startedSession(runtime);
+    const resultPromise = runtime.execute(session, { instruction: "x", output: "text" });
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+
+    child.stderr.emit("data", Buffer.from("fatal: api key sk-stderr-secret rejected\n"));
+    child.close(1);
+    await expect(resultPromise).rejects.toMatchObject({ code: "crash" });
+
+    const stderrLine = lines.find(
+      (l) => l.obj.event === "agent_child_output" && l.obj.stream === "stderr",
+    );
+    expect(stderrLine).toMatchObject({ level: "warn" });
+    expect(JSON.stringify(stderrLine)).not.toContain("sk-stderr-secret");
+    expect(JSON.stringify(stderrLine)).toContain("[redacted]");
+    delete process.env.MODEL_API_KEY;
+  });
+
+  it("reports a timeout before killing the child", async () => {
+    const child = new FakeChild();
+    const { logger, lines } = makeCaptureLogger();
+    const { runtime } = makeRuntime(child, { logger });
+    const session = await runtime.startSession({
+      reviewId: "rev_timeout_log",
+      workspacePath: "/tmp/w",
+      timeoutMs: 60,
+    });
+
+    const promise = runtime.execute(session, { instruction: "slow", output: "text" });
+    await expect(promise).rejects.toMatchObject({ code: "crash" });
+    expect(child.signals).toContain("SIGTERM");
+    expect(lines.find((l) => l.obj.event === "agent_execute_timeout")).toMatchObject({
+      level: "warn",
+      obj: { sigtermSent: true, timeoutMs: 60 },
+    });
+  }, 10_000);
+
+  it("logs normalized runtime errors with sanitized provider detail", async () => {
+    const child = new FakeChild();
+    const { logger, lines } = makeCaptureLogger();
+    const { runtime, calls } = makeRuntime(child, { logger });
+    const { session } = await startedSession(runtime);
+    const resultPromise = runtime.execute(session, { instruction: "x", output: "text" });
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+
+    child.writeOut(
+      JSON.stringify({ type: "error", message: "Provider reviewer: model not found (404)" }) + "\n",
+    );
+    child.close(0);
+    await expect(resultPromise).rejects.toMatchObject({ code: "provider_unavailable" });
+
+    expect(lines.find((l) => l.obj.event === "agent_runtime_error")).toMatchObject({
+      level: "error",
+      obj: {
+        code: "provider_unavailable",
+        detail: expect.stringContaining("model not found"),
+      },
+    });
+  });
+
+  it("bounds forwarded child output and reports truncation once", async () => {
+    const child = new FakeChild();
+    const { logger, lines } = makeCaptureLogger();
+    const { runtime, calls } = makeRuntime(child, { logger });
+    const { session } = await startedSession(runtime);
+    const resultPromise = runtime.execute(session, { instruction: "x", output: "text" });
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+
+    const noisy = Array.from({ length: 260 }, (_, i) =>
+      JSON.stringify({ type: "tool", part: { type: "tool", index: i } }),
+    );
+    child.writeOut([stepStart, textEvent("ok"), ...noisy, stepFinish].join("\n") + "\n");
+    child.close(0);
+    await resultPromise;
+
+    expect(lines.filter((l) => l.obj.event === "agent_child_output_truncated")).toHaveLength(1);
   });
 });
 

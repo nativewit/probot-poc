@@ -193,6 +193,14 @@ export type RunReviewOutput = {
 export interface ReviewInput {
   reviewId: string;
   workspace: WorkspaceResult;
+  /**
+   * Secret-free metadata used only for agent-trace correlation (Langfuse
+   * tags). Never passed to the model.
+   */
+  correlation?: {
+    repository?: string;
+    pullRequestNumber?: number;
+  };
 }
 
 export type { ChangedFile };

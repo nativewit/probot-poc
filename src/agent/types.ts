@@ -86,6 +86,14 @@ export interface AgentSessionOptions {
     maxInputTokens?: number;
     maxOutputTokens?: number;
   };
+  /**
+   * Secret-free correlation metadata for agent tracing (Langfuse trace tags).
+   * Never included in the task prompt or model request.
+   */
+  traceCorrelation?: {
+    repository?: string;
+    pullRequestNumber?: number;
+  };
 }
 
 export interface AgentSession {

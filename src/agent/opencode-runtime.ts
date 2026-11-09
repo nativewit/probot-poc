@@ -23,6 +23,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
+import { StringDecoder } from "node:string_decoder";
 
 import {
   AgentRuntimeError,
@@ -36,6 +37,7 @@ import {
 import {
   buildChildEnv,
   buildSessionConfig,
+  DEFAULT_LANGFUSE_PLUGIN,
   resolveModelId,
   type AgentRuntimeConfigSource,
 } from "./opencode-config.js";
@@ -102,6 +104,14 @@ const KILL_GRACE_MS = 2_000;
 const MAX_DETAIL_LENGTH = 500;
 /** Upper bound on captured child output (both streams), bytes. */
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+/** Max characters logged for a single sanitized child-output line. */
+const MAX_LOG_LINE_CHARS = 500;
+/** Aggregate cap on child-output characters forwarded to the logger. */
+const MAX_LOGGED_OUTPUT_CHARS = 32_000;
+/** Aggregate cap on child-output lines forwarded to the logger. */
+const MAX_LOGGED_OUTPUT_LINES = 200;
+/** Cadence for the "child still running" heartbeat. */
+const HEARTBEAT_INTERVAL_MS = 30_000;
 
 export class OpenCodeAgentRuntime implements AgentRuntime {
   private readonly binaryPath: string;
@@ -160,6 +170,9 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
       config: this.config,
       modelId,
       maxOutputTokens,
+      reviewId: options.reviewId,
+      repository: options.traceCorrelation?.repository,
+      pullRequestNumber: options.traceCorrelation?.pullRequestNumber,
     });
     // The config file contains no secret material — the API key is a
     // `{env:VAR}` reference resolved from the child environment.
@@ -169,11 +182,21 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
       "utf8",
     );
 
-    this.logger?.debug("agent session created", {
+    this.logger?.info("agent session created", {
+      event: "agent_session_created",
       sessionId: id,
       reviewId: options.reviewId,
       modelId,
-      sessionDir,
+      providerType: this.config.provider.type,
+      endpoint: endpointLabel(this.config.provider.baseURL),
+      apiKeyEnv: this.config.provider.apiKeyEnv,
+      workspacePath: options.workspacePath,
+      maxOutputTokens,
+      timeoutMs: options.timeoutMs ?? this.defaultTimeoutMs,
+      configPath: path.join(configDir, "opencode.json"),
+      agentTracing: this.config.observability?.langfuse?.enabled
+        ? (this.config.observability.langfuse.plugin ?? DEFAULT_LANGFUSE_PLUGIN)
+        : "off",
     });
 
     return {
@@ -192,13 +215,28 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
     const startedAt = Date.now();
     const prompt = buildPrompt(task);
     const args = ["run", "--format", "json", prompt];
-    const env = buildChildEnv(this.config, process.env);
+    const env = buildChildEnv(this.config, process.env, { reviewId: session.reviewId });
+    const modelId = resolveModelId(this.config, process.env);
     // Isolation: fresh per-session config/data; binary from PATH; no git
     // credential helpers, no GITHUB_TOKEN, nothing else from the host env.
     env.XDG_CONFIG_HOME = path.join(os.tmpdir(), "opencode-review-sessions", sessionDirKey(session), "config");
     env.XDG_DATA_HOME = path.join(os.tmpdir(), "opencode-review-sessions", sessionDirKey(session), "data");
 
-    this.logger?.debug("agent execute start", {
+    this.logger?.info("agent execute started", {
+      event: "agent_execute_started",
+      sessionId: session.id,
+      reviewId: session.reviewId,
+      modelId,
+      providerType: this.config.provider.type,
+      endpoint: endpointLabel(this.config.provider.baseURL),
+      workspacePath: session.workspacePath,
+      timeoutMs: session.timeoutMs,
+      outputMode: task.output,
+      instructionChars: task.instruction.length,
+      binaryPath: this.binaryPath,
+    });
+    this.logger?.debug("agent execute argv", {
+      event: "agent_execute_argv",
       sessionId: session.id,
       reviewId: session.reviewId,
       argv: ["opencode", ...args.slice(0, args.length - 1), "<prompt>"],
@@ -221,6 +259,13 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
       });
+      this.logger?.info("agent child spawned", {
+        event: "agent_child_spawned",
+        sessionId: session.id,
+        reviewId: session.reviewId,
+        pid: child.pid,
+        binaryPath: this.binaryPath,
+      });
     } catch (cause) {
       throw new AgentRuntimeError("spawn", "failed to launch opencode runtime", {
         sessionId: session.id,
@@ -236,14 +281,36 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
     running.add(child);
 
     try {
-      const outcome = await this.collect(child, session.id, session.timeoutMs);
+      const outcome = await this.collect(child, session, startedAt);
       const result = this.interpret(outcome, session.id, task, Date.now() - startedAt);
       await this.assertWorkspaceUnchanged(session, baseline);
       return result;
+    } catch (error) {
+      this.logAgentError(session, error);
+      throw error;
     } finally {
       running.delete(child);
       if (running.size === 0) this.running.delete(session.id);
     }
+  }
+
+  /** Log a normalized runtime failure with sanitized, truncated detail. */
+  private logAgentError(session: AgentSession, error: unknown): void {
+    if (!this.logger) return;
+    const code = error instanceof AgentRuntimeError ? error.code : "unknown";
+    const rawDetail =
+      error instanceof AgentRuntimeError
+        ? error.detail
+        : error instanceof Error
+          ? error.message
+          : String(error);
+    this.logger.error("agent runtime error", {
+      event: "agent_runtime_error",
+      sessionId: session.id,
+      reviewId: session.reviewId,
+      code,
+      detail: rawDetail ? truncate(scrub(rawDetail, this.config)) : undefined,
+    });
   }
 
   async terminate(session: AgentSession): Promise<void> {
@@ -343,42 +410,220 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
 
   private collect(
     child: import("node:child_process").ChildProcess,
-    sessionId: string,
-    timeoutMs: number,
+    session: AgentSession,
+    startedAt: number,
   ): Promise<{ stdout: string; stderr: string; exitCode: number | null; signal: string | null }> {
+    const { id: sessionId, reviewId } = session;
     return new Promise((resolve, reject) => {
       let stdout = "";
       let stderr = "";
       let truncated = false;
       let settled = false;
+      let timedOut = false;
+      let sigkillEscalated = false;
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+
+      // Logger bounds: never flood production logs with child output.
+      let loggedChars = 0;
+      let loggedLines = 0;
+      let logTruncated = false;
+
+      const stdoutDecoder = new StringDecoder("utf8");
+      const stderrDecoder = new StringDecoder("utf8");
+      let stdoutPartial = "";
+      let stderrPartial = "";
+
+      /**
+       * Forward one complete child-output line to the structured logger.
+       * stdout is NDJSON: only safe metadata is logged (event type, error
+       * summary, text length) — never prompts or file contents. stderr lines
+       * are sanitized and truncated before logging.
+       */
+      const logLine = (stream: "stdout" | "stderr", line: string): void => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        if (loggedLines >= MAX_LOGGED_OUTPUT_LINES || loggedChars >= MAX_LOGGED_OUTPUT_CHARS) {
+          if (!logTruncated) {
+            logTruncated = true;
+            this.logger?.warn("agent child output truncated", {
+              event: "agent_child_output_truncated",
+              sessionId,
+              reviewId,
+              maxLines: MAX_LOGGED_OUTPUT_LINES,
+              maxChars: MAX_LOGGED_OUTPUT_CHARS,
+            });
+          }
+          return;
+        }
+        loggedLines += 1;
+        loggedChars += trimmed.length;
+
+        if (stream === "stdout") {
+          let parsed: OpenCodeEvent | undefined;
+          try {
+            parsed = JSON.parse(trimmed) as OpenCodeEvent;
+          } catch {
+            parsed = undefined;
+          }
+          if (!parsed) {
+            this.logger?.debug("agent child output", {
+              event: "agent_child_output",
+              sessionId,
+              reviewId,
+              stream,
+              event_type: "unparsed",
+              bytes: Buffer.byteLength(trimmed, "utf8"),
+            });
+            return;
+          }
+          const type = typeof parsed.type === "string" ? parsed.type : "unknown";
+          if (type === "error") {
+            const message = typeof parsed.message === "string" ? parsed.message : "agent error event";
+            this.logger?.warn("agent child output", {
+              event: "agent_child_output",
+              sessionId,
+              reviewId,
+              stream,
+              event_type: "error",
+              summary: truncate(scrub(message, this.config), MAX_LOG_LINE_CHARS),
+            });
+            return;
+          }
+          if (type === "text") {
+            this.logger?.debug("agent child output", {
+              event: "agent_child_output",
+              sessionId,
+              reviewId,
+              stream,
+              event_type: "text",
+              chars: typeof parsed.part?.text === "string" ? parsed.part.text.length : 0,
+            });
+            return;
+          }
+          this.logger?.debug("agent child output", {
+            event: "agent_child_output",
+            sessionId,
+            reviewId,
+            stream,
+            event_type: type,
+          });
+          return;
+        }
+
+        // stderr: promote likely diagnostics to warn, everything else debug.
+        const looksLikeError =
+          /error|fail|fatal|exception|unauthor|forbidden|timeout|refused|denied|not found|401|403|404|429|5\d\d/i.test(
+            trimmed,
+          );
+        const summary = truncate(scrub(trimmed, this.config), MAX_LOG_LINE_CHARS);
+        const payload = {
+          event: "agent_child_output",
+          sessionId,
+          reviewId,
+          stream,
+          event_type: "stderr",
+          summary,
+          truncated: summary.endsWith("…[truncated]"),
+        };
+        if (looksLikeError) this.logger?.warn("agent child output", payload);
+        else this.logger?.debug("agent child output", payload);
+      };
+
+      const feed = (stream: "stdout" | "stderr", chunk: Buffer): void => {
+        const decoder = stream === "stdout" ? stdoutDecoder : stderrDecoder;
+        const combined = (stream === "stdout" ? stdoutPartial : stderrPartial) + decoder.write(chunk);
+        const lines = combined.split("\n");
+        const partial = lines.pop() ?? "";
+        if (stream === "stdout") stdoutPartial = partial;
+        else stderrPartial = partial;
+        for (const line of lines) logLine(stream, line);
+      };
+
+      const flush = (): void => {
+        const outTail = stdoutPartial + stdoutDecoder.end();
+        if (outTail) logLine("stdout", outTail);
+        const errTail = stderrPartial + stderrDecoder.end();
+        if (errTail) logLine("stderr", errTail);
+        stdoutPartial = "";
+        stderrPartial = "";
+      };
 
       const timer = setTimeout(() => {
         // Escalating kill: TERM first, KILL after the grace period.
+        timedOut = true;
+        this.logger?.warn("agent execute timeout", {
+          event: "agent_execute_timeout",
+          sessionId,
+          reviewId,
+          pid: child.pid,
+          timeoutMs: session.timeoutMs,
+          elapsedMs: Date.now() - startedAt,
+          sigtermSent: true,
+        });
         child.kill("SIGTERM");
         setTimeout(() => {
-          if (!settled && child.exitCode === null) child.kill("SIGKILL");
+          if (!settled && child.exitCode === null) {
+            sigkillEscalated = true;
+            this.logger?.warn("agent execute kill escalated", {
+              event: "agent_execute_timeout_escalated",
+              sessionId,
+              reviewId,
+              pid: child.pid,
+              signal: "SIGKILL",
+              graceMs: KILL_GRACE_MS,
+            });
+            child.kill("SIGKILL");
+          }
         }, KILL_GRACE_MS).unref();
-      }, timeoutMs);
+      }, session.timeoutMs);
       timer.unref();
 
+      // Periodic liveness evidence while the child is alive (a quiet model
+      // call must not look like a hang without at least a heartbeat).
+      let lastOutputAt = startedAt;
+      const heartbeat = setInterval(() => {
+        if (settled) return;
+        this.logger?.info("agent execute heartbeat", {
+          event: "agent_execute_heartbeat",
+          sessionId,
+          reviewId,
+          pid: child.pid,
+          elapsedMs: Date.now() - startedAt,
+          idleMs: Date.now() - lastOutputAt,
+          stdoutBytes,
+          stderrBytes,
+        });
+      }, HEARTBEAT_INTERVAL_MS);
+      heartbeat.unref();
+
       child.stdout?.on("data", (chunk: Buffer) => {
+        stdoutBytes += chunk.length;
+        lastOutputAt = Date.now();
         if (stdout.length + stderr.length > MAX_OUTPUT_BYTES) {
           truncated = true;
+          feed("stdout", chunk);
           return;
         }
         stdout += chunk.toString("utf8");
+        feed("stdout", chunk);
       });
       child.stderr?.on("data", (chunk: Buffer) => {
+        stderrBytes += chunk.length;
+        lastOutputAt = Date.now();
         if (stdout.length + stderr.length > MAX_OUTPUT_BYTES) {
           truncated = true;
+          feed("stderr", chunk);
           return;
         }
         stderr += chunk.toString("utf8");
+        feed("stderr", chunk);
       });
       child.once("error", (err: NodeJS.ErrnoException) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearInterval(heartbeat);
         reject(
           err.code === "ENOENT"
             ? new AgentRuntimeError("spawn", "opencode binary not found", { sessionId, cause: err })
@@ -392,6 +637,22 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearInterval(heartbeat);
+        flush();
+        this.logger?.info("agent execute exited", {
+          event: "agent_execute_exited",
+          sessionId,
+          reviewId,
+          exitCode: code,
+          signal,
+          durationMs: Date.now() - startedAt,
+          timedOut,
+          sigkillEscalated,
+          stdoutBytes,
+          stderrBytes,
+          outputTruncated: truncated,
+          loggedOutputTruncated: logTruncated,
+        });
         if (signal || (code !== null && code !== 0)) {
           reject(
             new AgentRuntimeError(
@@ -403,9 +664,6 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
           return;
         }
         resolve({ stdout, stderr, exitCode: code, signal });
-        if (truncated) {
-          this.logger?.warn("agent output truncated", { sessionId });
-        }
       });
     });
   }
@@ -640,6 +898,20 @@ function scrub(text: string, config: AgentRuntimeConfigSource): string {
 
 function truncate(text: string, max = MAX_DETAIL_LENGTH): string {
   return text.length <= max ? text : `${text.slice(0, max)}…[truncated]`;
+}
+
+/**
+ * Secret-free endpoint label: scheme + host + path only (no query string, no
+ * credentials). Falls back to "invalid" for malformed URLs so logging a bad
+ * configuration can never throw.
+ */
+function endpointLabel(baseURL: string): string {
+  try {
+    const url = new URL(baseURL);
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return "invalid";
+  }
 }
 
 // ---------------------------------------------------------------------------

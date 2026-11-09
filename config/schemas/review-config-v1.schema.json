@@ -341,6 +341,14 @@
           "additionalProperties": false,
           "properties": { "enabled": { "type": "boolean" } }
         },
+        "langfuse": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "plugin": { "type": "string", "minLength": 1, "maxLength": 200 }
+          }
+        },
         "alerts": {
           "type": "object",
           "additionalProperties": false,

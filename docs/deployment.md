@@ -79,6 +79,52 @@ Key properties (enforced by the compose file and asserted by
 4. Required variables are declared with `:?` in the compose file, so
    `docker compose config` fails fast when something is missing.
 
+### Agent tracing (optional — Langfuse)
+
+Agent-level tracing (prompts, model generations, tool calls, retries, errors,
+token usage) is delegated to the
+[Langfuse OpenCode plugin](https://langfuse.com/integrations/developer-tools/opencode),
+not reimplemented in this application. The worker only:
+
+1. enables the pinned plugin in the generated per-session `opencode.json`
+   when `observability.langfuse.enabled` is `true` (config/review.json —
+   **disabled by default**), and
+2. forwards the Langfuse credentials to the isolated OpenCode child process.
+
+Set these in `deploy/.env` (or the Dokploy environment tab) before enabling:
+
+```sh
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+# Cloud default; set for self-hosted instances:
+# LANGFUSE_BASE_URL=https://langfuse.example.com
+# LANGFUSE_ENVIRONMENT=production
+```
+
+Correlation: the worker sets `LANGFUSE_USER_ID=review:<reviewId>` and passes
+secret-free trace tags — `review:<reviewId>`, `repository:<owner/name>` and
+`pr:<number>` — as plugin options (required because the plugin ignores
+config-file tags when credentials come from the environment). The same review
+id, PR and repository appear in the worker's structured (Pino) logs, so a
+Langfuse trace and its worker logs can be matched directly. Correlation values
+are metadata only and never enter the prompt or model request. Credentials are
+passed only via
+the child environment — they are never written to `opencode.json` and child
+processes receive nothing outside their allowlist.
+
+> **Privacy:** the plugin can capture prompts, model responses, reasoning
+> exposed by OpenCode, and tool inputs/outputs, which may include proprietary
+> source code. Enable it first on a restricted repository, and agree on
+> redaction, access control and retention **before** enabling it
+> production-wide. Hidden chain-of-thought is not captured by this
+> application, and secrets must never be placed in `config/review.json`.
+
+Set the credentials **before** enabling tracing: the plugin is loaded into
+every review session, and missing credentials mean traces are silently lost.
+Tracing export failures must never be treated as review failures, but a
+misconfigured/absent plugin package should be caught in a staging review
+before production rollout.
+
 ## 4. First deployment
 
 ```sh

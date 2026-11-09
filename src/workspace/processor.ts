@@ -21,6 +21,7 @@ import {
   createReviewLogger,
   startStage,
   type ReviewCorrelation,
+  type StageTracker,
 } from "../observability/correlation.js";
 import { getMetricsRegistry } from "../observability/metrics.js";
 import { endSpan, reviewSpanAttributes, startSpan } from "../observability/tracing.js";
@@ -92,6 +93,7 @@ export async function processReviewJob(
   });
 
   let span: ReturnType<typeof startSpan> | undefined;
+  let activeStage: StageTracker | undefined;
   try {
     await transitionReviewState(job.reviewId, "preparing");
     await transitionReviewState(job.reviewId, "cloning");
@@ -112,6 +114,7 @@ export async function processReviewJob(
     span = startSpan("review.process", { attributes: reviewSpanAttributes(correlation) });
 
     const cloneStage = startStage(reviewLogger, "clone");
+    activeStage = cloneStage;
     const workspace = await deps.service.prepare({
       reviewId: job.reviewId,
       repositoryFullName: payload.repositoryFullName,
@@ -122,14 +125,17 @@ export async function processReviewJob(
       baseRef: null,
     });
     cloneStage.end();
+    activeStage = undefined;
 
     await transitionReviewState(job.reviewId, "analyzing");
 
     // Ticket 07: the review engine runs inside the hook (workspace is still
     // present; it is disposed afterwards per repository.workspace config).
     const analyzeStage = startStage(reviewLogger, "analyze");
+    activeStage = analyzeStage;
     await deps.onWorkspacePrepared?.({ payload, workspace });
     analyzeStage.end();
+    activeStage = undefined;
 
     await deps.service.cleanupAfterReview(job.reviewId);
     await prisma.reviewJob.update({ where: { id: job.id }, data: { status: "completed" } });
@@ -141,6 +147,13 @@ export async function processReviewJob(
     return "processed";
   } catch (error) {
     const message = redactCredentials(error instanceof Error ? error.message : String(error));
+    activeStage?.fail(error, { error: message });
+    // AgentRuntimeError carries the sanitized provider/opencode detail; without
+    // it the worker only reports a generic message and the root cause is lost.
+    const rawDetail = (error as { detail?: unknown } | null)?.detail;
+    const errorDetail =
+      typeof rawDetail === "string" ? redactCredentials(rawDetail).slice(0, 500) : undefined;
+    const errorCode = (error as { code?: unknown } | null)?.code;
     const failureClass = classifyFailure({
       errorCode: error instanceof ReviewRetrievalError ? error.code : null,
       message,
@@ -158,6 +171,8 @@ export async function processReviewJob(
         jobId,
         reviewId: job.reviewId,
         err: message,
+        err_detail: errorDetail,
+        error_code: typeof errorCode === "string" ? errorCode : undefined,
         failure_class: failureClass,
         retry_decision: decision,
       },

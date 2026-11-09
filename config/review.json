@@ -144,6 +144,10 @@
     "logs": { "level": "info", "format": "json" },
     "metrics": { "enabled": true },
     "tracing": { "enabled": true },
+    "langfuse": {
+      "enabled": true,
+      "plugin": "@langfuse/opencode-observability-plugin@0.7.0"
+    },
     "alerts": {
       "reviewFailure": true,
       "queueBacklog": true,

@@ -67,7 +67,17 @@ export function createReviewEngineHook(deps: ReviewEngineHookDeps): ReviewEngine
 
     let output;
     try {
-      output = await runReview({ reviewId, workspace }, { runtime: deps.runtime, config: deps.config });
+      output = await runReview(
+        {
+          reviewId,
+          workspace,
+          correlation: {
+            repository: ctx.payload.repositoryFullName,
+            pullRequestNumber: ctx.payload.pullRequestNumber,
+          },
+        },
+        { runtime: deps.runtime, config: deps.config },
+      );
     } catch (error) {
       endSpan(modelSpan, error);
       endSpan(span, error);

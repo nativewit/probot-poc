@@ -37,9 +37,15 @@ export interface AgentRuntimeConfigSource {
     };
     tools: { enabled: string[]; permissionPolicy: "allowlist" | "none" };
   };
+  /**
+   * Optional agent-trace integration. Only the Langfuse OpenCode plugin is
+   * supported: the application just enables it and forwards credentials to the
+   * isolated child — trace storage/visualisation stays in Langfuse.
+   */
+  observability?: {
+    langfuse?: { enabled?: boolean; plugin?: string };
+  };
 }
-
-
 
 /**
  * Map the central `agent.tools.enabled` allowlist (conceptual tool names from
@@ -106,6 +112,9 @@ export function buildPermissionRules(config: AgentRuntimeConfigSource): Record<s
   return permission;
 }
 
+/** Default agent-tracing plugin (pinned; bump deliberately). */
+export const DEFAULT_LANGFUSE_PLUGIN = "@langfuse/opencode-observability-plugin@0.7.0";
+
 /** Environment variables the OpenCode child process is allowed to inherit. */
 const CHILD_ENV_ALLOWLIST = [
   "PATH",
@@ -117,12 +126,33 @@ const CHILD_ENV_ALLOWLIST = [
 ] as const;
 
 /**
+ * Langfuse credentials forwarded to the child so the OpenCode observability
+ * plugin can ship session traces. Keys are only ever passed by value to the
+ * child process, never written to the generated opencode.json.
+ */
+const LANGFUSE_ENV_ALLOWLIST = [
+  "LANGFUSE_PUBLIC_KEY",
+  "LANGFUSE_SECRET_KEY",
+  "LANGFUSE_BASE_URL",
+  "LANGFUSE_ENVIRONMENT",
+  "LANGFUSE_USER_ID",
+] as const;
+
+/**
  * Build the sanitized child-process environment. Only allowlisted variables
  * plus the model-provider credentials (by env-var name from the central
  * configuration) are passed — GitHub credentials and every other secret of
  * the trusted application are never visible to the agent (§10.6).
+ *
+ * When Langfuse tracing is enabled the missing correlation adapter is just
+ * `LANGFUSE_USER_ID`: a stable, secret-free label derived from the review id
+ * so traces can be filtered back to the PR review (Pino carries the rest).
  */
-export function buildChildEnv(config: AgentRuntimeConfigSource, env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function buildChildEnv(
+  config: AgentRuntimeConfigSource,
+  env: NodeJS.ProcessEnv,
+  correlation?: { reviewId?: string },
+): NodeJS.ProcessEnv {
   const child: NodeJS.ProcessEnv = {};
   for (const name of CHILD_ENV_ALLOWLIST) {
     if (env[name] !== undefined) child[name] = env[name];
@@ -132,6 +162,16 @@ export function buildChildEnv(config: AgentRuntimeConfigSource, env: NodeJS.Proc
   if (env[keyName] !== undefined) child[keyName] = env[keyName];
   if (env.MODEL_BASE_URL !== undefined) child.MODEL_BASE_URL = env.MODEL_BASE_URL;
   if (env.MODEL_NAME !== undefined) child.MODEL_NAME = env.MODEL_NAME;
+
+  // Agent tracing credentials (no-op unless the Langfuse plugin is enabled).
+  if (config.observability?.langfuse?.enabled) {
+    for (const name of LANGFUSE_ENV_ALLOWLIST) {
+      if (env[name] !== undefined) child[name] = env[name];
+    }
+    if (correlation?.reviewId) {
+      child.LANGFUSE_USER_ID = `review:${correlation.reviewId}`;
+    }
+  }
   return child;
 }
 
@@ -144,6 +184,30 @@ export interface OpenCodeSessionConfigInput {
   modelId: string;
   /** Resolved output-token budget for the model. */
   maxOutputTokens: number;
+  /** Correlation id used for agent-trace tags (never sent to the model). */
+  reviewId?: string;
+  /** Repository full name used for agent-trace tags (never sent to the model). */
+  repository?: string;
+  /** PR number used for agent-trace tags (never sent to the model). */
+  pullRequestNumber?: number;
+}
+
+/**
+ * Build secret-free Langfuse trace tags for one review. Tags are metadata
+ * only; the review prompt and model request are unaffected. They are supplied
+ * as plugin options because the plugin ignores config-file tags whenever
+ * credentials come from the environment (our isolation model).
+ */
+export function buildTraceTags(input: {
+  reviewId?: string;
+  repository?: string;
+  pullRequestNumber?: number;
+}): string[] {
+  const tags: string[] = [];
+  if (input.reviewId) tags.push(`review:${input.reviewId}`);
+  if (input.repository) tags.push(`repository:${input.repository}`);
+  if (typeof input.pullRequestNumber === "number") tags.push(`pr:${input.pullRequestNumber}`);
+  return tags;
 }
 
 /**
@@ -154,12 +218,24 @@ export interface OpenCodeSessionConfigInput {
  */
 export function buildSessionConfig(input: OpenCodeSessionConfigInput): Record<string, unknown> {
   const { config } = input;
+  const langfuse = config.observability?.langfuse;
+  const traceTags = buildTraceTags(input);
+  const pluginEntry =
+    traceTags.length > 0
+      ? {
+          package: langfuse?.plugin ?? DEFAULT_LANGFUSE_PLUGIN,
+          options: { tags: traceTags },
+        }
+      : (langfuse?.plugin ?? DEFAULT_LANGFUSE_PLUGIN);
   return {
     $schema: "https://opencode.ai/config.json",
     model: "reviewer/glm",
     update: "disable",
     snapshots: false,
     permission: buildPermissionRules(config),
+    // OpenCode 2 uses the plural `plugins` key. The plugin package is public;
+    // Langfuse credentials are supplied through the child environment only.
+    ...(langfuse?.enabled ? { plugins: [pluginEntry] } : {}),
     providers: {
       reviewer: {
         name: "Review Model Provider",

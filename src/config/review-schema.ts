@@ -299,6 +299,19 @@ const observabilitySchema = z.object({
     .prefault({}),
   metrics: z.object({ enabled: z.boolean().default(true) }).prefault({}),
   tracing: z.object({ enabled: z.boolean().default(true) }).prefault({}),
+  // Agent-level tracing is delegated to Langfuse's OpenCode plugin. This
+  // application only enables the plugin and supplies correlation/credentials
+  // through the isolated child environment — no custom trace schema/DB.
+  langfuse: z
+    .object({
+      enabled: z.boolean().default(false),
+      plugin: z
+        .string()
+        .min(1)
+        .max(200)
+        .default("@langfuse/opencode-observability-plugin@0.7.0"),
+    })
+    .prefault({}),
   alerts: z
     .object({
       reviewFailure: z.boolean().default(true),

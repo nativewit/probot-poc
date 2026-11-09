@@ -179,6 +179,7 @@ export async function runReview(input: ReviewInput, deps: EngineDeps): Promise<R
     workspacePath: workspace.workspacePath,
     timeoutMs: plan.budgets.timeoutMs,
     maxOutputTokens: plan.budgets.maxOutputTokens,
+    traceCorrelation: input.correlation,
     context: {
       maxFiles: plan.budgets.maxFileRetrievals,
       maxRetrievalCalls: plan.budgets.maxModelCalls,

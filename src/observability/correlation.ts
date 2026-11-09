@@ -43,21 +43,51 @@ export function withRuntimeIdentity(
 export interface StageTracker {
   /** Log a stage completion with its duration. Returns the elapsed ms. */
   end(extra?: Record<string, unknown>): number;
+  /**
+   * Log a stage failure with the elapsed time and a sanitized, truncated
+   * reason. Returns the elapsed ms. Safe to call at most once.
+   */
+  fail(error: unknown, extra?: Record<string, unknown>): number;
 }
 
 /**
- * Start a stage timer. `stageTracker.end("clone")` logs
- * `{ stage: "clone", duration_ms: n }` at info level.
+ * Start a stage timer.
+ *
+ * Emits `review_stage_started` immediately so a long-running stage can never
+ * look like a silent hang, then `review_stage_completed` /
+ * `review_stage_failed` when the stage ends.
  */
 export function startStage(
   logger: ReviewLogger,
   stage: string,
 ): StageTracker {
   const started = Date.now();
+  logger.info({ event: "review_stage_started", stage }, `Review stage started: ${stage}`);
   return {
     end(extra?: Record<string, unknown>): number {
       const durationMs = Date.now() - started;
-      logger.info({ stage, duration_ms: durationMs, ...(extra ?? {}) }, `Review stage completed: ${stage}`);
+      logger.info(
+        { event: "review_stage_completed", stage, duration_ms: durationMs, ...(extra ?? {}) },
+        `Review stage completed: ${stage}`,
+      );
+      return durationMs;
+    },
+    fail(error: unknown, extra?: Record<string, unknown>): number {
+      const durationMs = Date.now() - started;
+      const message = error instanceof Error ? error.message : String(error);
+      // Never log the raw error text here: callers pass a sanitized `error`
+      // through `extra` (see processReviewJob). Only safe metadata is default.
+      logger.error(
+        {
+          event: "review_stage_failed",
+          stage,
+          duration_ms: durationMs,
+          error_name: error instanceof Error ? error.name : typeof error,
+          error_chars: message.length,
+          ...(extra ?? {}),
+        },
+        `Review stage failed: ${stage}`,
+      );
       return durationMs;
     },
   };

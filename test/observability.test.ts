@@ -186,14 +186,39 @@ describe("correlation logging", () => {
     expect(correlation).not.toHaveProperty("model");
   });
 
-  test("startStage emits stage completion with duration", () => {
+  test("startStage emits stage start and completion with duration", () => {
     const { logger, lines } = bufferedLogger();
     const tracker = startStage(logger, "clone");
     const elapsed = tracker.end({ head_sha: "aaaa1111" });
 
     expect(elapsed).toBeGreaterThanOrEqual(0);
-    expect(lines[0]).toMatchObject({ stage: "clone", msg: "Review stage completed: clone" });
-    expect(lines[0].duration_ms).toBeTypeOf("number");
+    expect(lines[0]).toMatchObject({
+      event: "review_stage_started",
+      stage: "clone",
+      msg: "Review stage started: clone",
+    });
+    expect(lines[1]).toMatchObject({
+      event: "review_stage_completed",
+      stage: "clone",
+      msg: "Review stage completed: clone",
+    });
+    expect(lines[1].duration_ms).toBeTypeOf("number");
+  });
+
+  test("startStage.fail emits a stage failure and only logs caller-sanitized error text", () => {
+    const { logger, lines } = bufferedLogger();
+    const tracker = startStage(logger, "analyze");
+    const elapsed = tracker.fail(new Error("provider rejected: bad key"), {
+      error: "provider rejected: bad key",
+    });
+
+    expect(elapsed).toBeGreaterThanOrEqual(0);
+    expect(lines[1]).toMatchObject({
+      event: "review_stage_failed",
+      stage: "analyze",
+      error_name: "Error",
+      error: "provider rejected: bad key",
+    });
   });
 });
 
