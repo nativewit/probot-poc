@@ -269,58 +269,57 @@ exactly this file (do **not** include the local override):
 | Compose file | `deploy/docker-compose.dozzle.yml` |
 | Service | `dozzle` |
 | Domain → Container Port | `8080` |
-| Environment | `DOZZLE_DATA_DIR=/etc/dozzle` |
+| Environment | `DOZZLE_ADMIN_PASSWORD` (required) |
 
 The file declares the project name `ai-pr-reviewer-logs`, joins the external
-`dokploy-network`, and publishes no host ports. `DOZZLE_DATA_DIR` is the host
-**directory** mounted at `/data`; it must contain `users.yml` and also holds
-Dozzle's session secret/settings.
+`dokploy-network`, and publishes no host ports. It contains two services:
 
-1. **Generate credentials** on the Dokploy host, outside the repo checkout
-   (Dokploy re-clones the checkout on redeploy, so anything inside it is
-   disposable):
+- `dozzle-init` — a one-shot that generates `/data/users.yml` (bcrypt) from
+  environment variables into the `dozzle-data` volume and exits.
+- `dozzle` — starts only after the init succeeds.
 
-   ```sh
-   sudo mkdir -p /etc/dozzle
-   sudo docker run -it --rm amir20/dozzle:v11.4.1 generate admin \
-     --email ops@yourdomain.com --name "Ops Admin" \
-     > /etc/dozzle/users.yml
-   sudo chmod 600 /etc/dozzle/users.yml
-   ```
+**No host-side file creation or shell access is needed** — everything is
+driven from Compose environment variables, so it works from the Dokploy UI.
 
-   Omit `--password` to be prompted on stdin. Dozzle v11 uses the `simple`
-   auth provider reading `/data/users.yml` (bcrypt hashes) — the old
-   `DOZZLE_USER_*` env vars no longer exist. Without the file, login fails
-   closed: there is no anonymous access.
+1. **Set environment variables** on the Compose service:
 
-   Set `DOZZLE_DATA_DIR=/etc/dozzle` on the Compose service. Mount the
-   directory, **not** the file: if a single-file bind source is missing,
-   Docker creates it as a directory and Dozzle crash-loops with
-   `read /data/users.yml: is a directory`. If that has already happened,
-   delete the directory (`sudo rm -rf /etc/dozzle/users.yml`) and regenerate
-   the file.
+   | Variable | Required | Meaning |
+   |---|---|---|
+   | `DOZZLE_ADMIN_PASSWORD` | yes | password for the `admin` login |
+   | `DOZZLE_ADMIN_EMAIL` | no | default `admin@localhost` (avatar only) |
+   | `DOZZLE_ADMIN_NAME` | no | default `Admin` |
+   | `DOZZLE_FORCE_USERS` | no | `1` = regenerate `users.yml` on next deploy |
 
-   For a local run you can omit `DOZZLE_DATA_DIR`; the default is the
-   `deploy/dozzle/` directory (gitignored, `.gitkeep` tracked).
+   Dozzle v11 uses the `simple` auth provider reading `/data/users.yml`; the
+   old `DOZZLE_USER_*` env vars no longer exist. Without a users file, login
+   fails closed: there is no anonymous access.
+
 2. **Deploy**: create the service pointing at
-   `deploy/docker-compose.dozzle.yml` and attach a domain (see §10.2).
+   `deploy/docker-compose.dozzle.yml` and attach a domain (see §10.2). The
+   init container runs first and writes the credentials into the
+   `dozzle-data` named volume (which survives redeploys).
 3. **Log in**: browse to the domain (e.g. `https://logs.yourdomain.com`) or,
-   for a local smoke run, `http://127.0.0.1:8080`. Dozzle redirects to
-   `/login`; sign in with:
-   - **username** — the first argument to the `generate` command above
-     (`admin` in the example),
-   - **password** — the value typed at the `--password` prompt.
-
-   `users.yml` stores only bcrypt hashes, so a forgotten password cannot be
-   recovered. Regenerate the entry (rerun `generate`) and restart/redeploy.
-   To add another user, run `generate <username>` again and append its block
-   to the same `users.yml`.
+   for a local run, `http://127.0.0.1:8080`. Dozzle redirects to `/login`;
+   sign in with username **`admin`** and the password from
+   `DOZZLE_ADMIN_PASSWORD`.
 4. **Verify**: after logging in, confirm the `ai-pr-reviewer-*` containers
    appear in the list.
 
-Dozzle's own state (session secret, saved settings) lives in the same host
-directory, so logins survive container recreation and redeploys (as long as
-`DOZZLE_DATA_DIR` points outside the re-cloned checkout).
+`users.yml` stores only bcrypt hashes. Changing `DOZZLE_ADMIN_PASSWORD` alone
+does **not** update an existing file (the init leaves an existing
+`users.yml` untouched). To rotate the password, set
+`DOZZLE_FORCE_USERS=1`, redeploy, then unset it again.
+
+Local smoke run without Dokploy/Traefik (localhost-only binding, Compose
+creates a local network):
+
+```sh
+DOZZLE_ADMIN_PASSWORD='change-me' \
+docker compose \
+  -f deploy/docker-compose.dozzle.yml \
+  -f deploy/docker-compose.dozzle.local.yml \
+  up -d   # http://127.0.0.1:8080
+```
 
 ### 10.2 Domain and Traefik (custom or Dokploy free domain)
 
@@ -374,30 +373,26 @@ docker compose \
 
 ### 10.4 Troubleshooting
 
-Both of these crash-loop with `level":"fatal"` in `docker logs`:
-
-- **`read /data/users.yml: is a directory`** — `DOZZLE_DATA_DIR` pointed at a
-  path that did not exist as a file, so Docker created a directory. Use a
-  directory mount (the compose file already does); remove the stray
-  directory and regenerate the file.
-- **`No users.yaml or users.yml file found.`** — the directory mounted at
-  `/data` exists but is empty (commonly the repo's `deploy/dozzle/`, because
-  `DOZZLE_DATA_DIR` was not set on the Dokploy service). Find the actual
-  host directory that was mounted:
+- **`No users.yaml or users.yml file found.`** — `dozzle-init` did not create
+  the file, usually because `DOZZLE_ADMIN_PASSWORD` was not set on the
+  service (the init exits with `DOZZLE_ADMIN_PASSWORD must be set`). Check:
 
   ```sh
-  docker ps --filter name=dozzle
-  docker inspect ai-pr-reviewer-logs-dozzle-1 \
-    --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
-  ls -la /etc/dozzle
+  docker logs ai-pr-reviewer-logs-dozzle-init-1
+  docker volume inspect ai-pr-reviewer-logs_dozzle-data
   ```
 
-  Then either put `users.yml` into the directory that `/data` is bound to, or
-  set `DOZZLE_DATA_DIR` on the Compose service to the directory containing
-  it and redeploy. Remember: changing the env var does nothing until the
-  service is redeployed.
+  Then set the variable on the Dokploy Compose service and redeploy.
+- **Login rejected after changing `DOZZLE_ADMIN_PASSWORD`** — the init leaves
+  an existing `users.yml` untouched. Set `DOZZLE_FORCE_USERS=1`, redeploy,
+  then unset it.
+- **`read /data/users.yml: is a directory`** — this came from bind-mounting a
+  single file that did not exist. The stack now uses the `dozzle-data` named
+  volume instead; if you customised the mounts, mount a directory (or the
+  named volume), never a single `users.yml` path.
 
-`users.yml` must be a regular file (`-rw-------`), never a directory.
+Credentials are generated into the named volume, so they persist across
+redeploys and are never committed to git.
 
 ## 11. Validation runbook
 
@@ -426,5 +421,6 @@ Scenarios from architecture §10.4, with local verification status:
 9. **Dozzle smoke (local override)** — verified: container `healthy`,
    `/healthcheck` returns 200, unauthenticated `/` redirects to `/login`,
    login with generated credentials returns 200 (wrong password 401), and
-   `down` leaves no containers or networks behind. *Dokploy/Traefik ingress
-   and `/etc/dozzle` are user-environment steps (§10).*
+   `down` leaves no containers or networks behind. *The env-driven
+   `dozzle-init` credential flow and Dokploy/Traefik ingress are
+   user-environment steps (§10).*

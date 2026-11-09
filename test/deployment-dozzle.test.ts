@@ -10,7 +10,9 @@
  *     and its tests stay completely unchanged — see
  *     test/deployment-compose.test.ts, which must keep passing as-is).
  *   - No host ports (Dokploy Traefik ingress over dokploy-network).
- *   - Authentication, disabled actions/shell, pinned image.
+ *   - Authentication generated from env vars into a named volume, so the
+ *     stack deploys from Compose alone (no host-side file creation).
+ *   - Disabled actions/shell, pinned image.
  *
  * Parsed with the `yaml` package (raw file, no compose interpolation).
  */
@@ -23,24 +25,54 @@ const composePath = path.resolve(__dirname, "../deploy/docker-compose.dozzle.yml
 const compose = parse(readFileSync(composePath, "utf8"), { merge: true }) as {
   services: Record<string, any>;
   networks: Record<string, any>;
+  volumes: Record<string, any>;
 };
 
 const MAIN_COMPOSE_PATH = path.resolve(__dirname, "../deploy/docker-compose.yml");
 
 describe("dozzle compose structure (operations stack)", () => {
-  it("contains only the dozzle service (separate project, not the app stack)", () => {
-    expect(Object.keys(compose.services)).toEqual(["dozzle"]);
+  it("contains only the dozzle service plus its auth init (separate project)", () => {
+    expect(Object.keys(compose.services).sort()).toEqual(["dozzle", "dozzle-init"]);
     expect(compose.services.dozzle.image).toBe("amir20/dozzle:v11.4.1");
+    expect(compose.services["dozzle-init"].image).toBe("amir20/dozzle:v11.4.1-alpine");
   });
 
-  it("mounts the Docker socket READ-ONLY and a host DATA DIRECTORY at /data", () => {
+  it("mounts the Docker socket READ-ONLY and shared state as a named volume", () => {
     const mounts = compose.services.dozzle.volumes as string[];
     expect(mounts).toContain("/var/run/docker.sock:/var/run/docker.sock:ro");
-    expect(mounts.some((m) => m.endsWith(":/data"))).toBe(true);
-    // Regression: never bind-mount users.yml as a single file. If the host
-    // file is missing, Docker creates a directory and Dozzle crash-loops
+    expect(mounts).toContain("dozzle-data:/data");
+    // Regression: never bind-mount users.yml (or its host dir) directly.
+    // A missing single-file source becomes a directory and Dozzle crashes
     // with "read /data/users.yml: is a directory".
     expect(mounts.some((m) => m.includes("/data/users.yml"))).toBe(false);
+    expect(compose.volumes).toHaveProperty("dozzle-data");
+  });
+
+  it("generates users.yml from env vars before dozzle starts", () => {
+    const init = compose.services["dozzle-init"];
+    const command = init.command as string[];
+    const script = command[0];
+    expect(script).toContain("/dozzle generate admin");
+    // Password is passed positionally ($1) rather than read inside the shell,
+    // so Compose interpolation never has to escape shell `$VAR` references.
+    expect(script).toContain('--password "$1"');
+    expect(script).toContain('[ -z "$1" ]');
+    expect(command[1]).toBe("dozzle-init");
+    expect(command[2]).toContain("DOZZLE_ADMIN_PASSWORD");
+    expect(command[5]).toContain("DOZZLE_FORCE_USERS");
+    expect(init.volumes).toContain("dozzle-data:/data");
+    expect(init.environment).toBeUndefined();
+    expect(compose.services.dozzle.depends_on["dozzle-init"].condition).toBe(
+      "service_completed_successfully",
+    );
+  });
+
+  it("deploys auth from Compose env only (no host files, no manual steps)", () => {
+    const raw = readFileSync(composePath, "utf8");
+    // No host bind mount for /data; credentials live in the named volume.
+    expect(raw).not.toContain("DOZZLE_DATA_DIR");
+    expect(raw).not.toContain("DOZZLE_USERS_FILE");
+    expect(compose.services.dozzle.volumes).toContain("dozzle-data:/data");
   });
 
   it("publishes NO host ports (expose 8080 for the Traefik ingress)", () => {
@@ -78,7 +110,7 @@ describe("dozzle compose structure (operations stack)", () => {
     expect(main.includes("docker.sock")).toBe(false);
   });
 
-  it("documents the users.yml generation requirement (never ships credentials)", () => {
+  it("never ships credentials (no inline users or bcrypt hashes)", () => {
     const raw = readFileSync(composePath, "utf8");
     expect(raw).toMatch(/dozzle.*generate/); // documented generation command
     expect(raw).not.toMatch(/^\s*users:/m); // no inline user entries
