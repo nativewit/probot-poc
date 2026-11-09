@@ -125,6 +125,10 @@ Tracing export failures must never be treated as review failures, but a
 misconfigured/absent plugin package should be caught in a staging review
 before production rollout.
 
+Tracing requires **OpenCode ≥ 2.2.6**: v2.2.5 silently ignores the configured
+`plugins` in `opencode run` mode (no error, no traces). The `Dockerfile` pins
+2.2.6 for this reason — do not downgrade it.
+
 The plugin package is **pre-installed at image build time**
 (`opencode plugin add` in the `Dockerfile`). This is required: `opencode run`
 does not install a missing package plugin by itself, and every review uses an

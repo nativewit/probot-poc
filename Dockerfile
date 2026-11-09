@@ -28,7 +28,10 @@ ENV NODE_ENV=production
 #                      not via the v1 install script (which refuses 2.x).
 ARG TARGETARCH
 ARG DOCKER_CLI_VERSION=28.3.3
-ARG OPENCODE_VERSION=2.2.5
+# 2.2.6 is the first pinned version verified to load package plugins in
+# `opencode run` mode (2.2.5 silently ignores the configured `plugins`, which
+# suppresses Langfuse tracing without any error).
+ARG OPENCODE_VERSION=2.2.6
 RUN set -eux; \
     case "$TARGETARCH" in \
       amd64) docker_arch=x86_64; oc_arch=x64-baseline ;; \
