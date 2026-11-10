@@ -489,6 +489,52 @@ describe("worker processor", () => {
     expect(fs.existsSync(root)).toBe(true); // root survives, workspaces don't
   });
 
+  test("job still marked pending_outbox is claimed and processed (outbox publish race)", async () => {
+    // The queue job can become visible a moment before the outbox publisher
+    // commits `enqueued`. The processor must claim it instead of discarding it,
+    // otherwise BullMQ marks the skip as success and the review is lost.
+    const { service } = makeService();
+    const chain = await createReviewChain();
+    await prisma.reviewJob.update({ where: { id: chain.jobId }, data: { status: "pending_outbox" } });
+    let prepared = 0;
+    const outcome = await processReviewJob(chain.jobId, {
+      reviewId: chain.reviewId,
+      jobKey: "k",
+      githubInstallationId: INSTALLATION_ID.toString(),
+      githubRepositoryId: "12345",
+      repositoryFullName: REPO_FULL_NAME,
+      pullRequestNumber: PR_NUMBER,
+      headSha,
+      reviewMode: "standard",
+      trigger: "opened",
+    }, { ...makeDeps(service, silentLogger), onWorkspacePrepared: async () => { prepared += 1; } });
+
+    expect(outcome).toBe("processed");
+    expect(prepared).toBe(1);
+    const job = await prisma.reviewJob.findUnique({ where: { id: chain.jobId } });
+    expect(job?.status).toBe("completed");
+    expect(job?.attempts).toBe(1);
+  });
+
+  test("completed job is still skipped", async () => {
+    const { service } = makeService();
+    const chain = await createReviewChain();
+    await prisma.reviewJob.update({ where: { id: chain.jobId }, data: { status: "completed" } });
+    const outcome = await processReviewJob(chain.jobId, {
+      reviewId: chain.reviewId,
+      jobKey: "k",
+      githubInstallationId: INSTALLATION_ID.toString(),
+      githubRepositoryId: "12345",
+      repositoryFullName: REPO_FULL_NAME,
+      pullRequestNumber: PR_NUMBER,
+      headSha,
+      reviewMode: "standard",
+      trigger: "opened",
+    }, makeDeps(service, silentLogger));
+    expect(outcome).toBe("skipped_status");
+    expect(await prisma.reviewWorkspace.count({ where: { reviewId: chain.reviewId } })).toBe(0);
+  });
+
   test("processing failure marks job + review failed and cleans up", async () => {
     const { service } = makeService({ cloneUrlBuilder: () => path.join(fixtureDir, "missing.git") });
     const chain = await createReviewChain();

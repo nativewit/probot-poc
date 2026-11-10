@@ -82,15 +82,23 @@ export async function processReviewJob(
     logger.info({ jobId, reviewId: job.reviewId }, "Review job superseded before processing; skipping");
     return "skipped_superseded";
   }
-  if (job.status !== "enqueued" && job.status !== "processing") {
+  // Claim the durable row atomically instead of trusting the snapshot read
+  // above. The outbox publisher commits `enqueued` in Postgres and only then
+  // (in the old ordering) made the queue job visible, so an idle worker could
+  // legitimately observe `pending_outbox` for an in-flight job and discard it
+  // as "not processable" — BullMQ then treats the skip as a successful run.
+  // `processing` stays claimable so a stalled/retried delivery can resume.
+  const claimed = await prisma.reviewJob.updateMany({
+    where: {
+      id: job.id,
+      status: { in: ["pending_outbox", "enqueued", "processing"] },
+    },
+    data: { status: "processing", attempts: { increment: 1 } },
+  });
+  if (claimed.count === 0) {
     logger.info({ jobId, status: job.status }, "Review job not in a processable state; skipping");
     return "skipped_status";
   }
-
-  await prisma.reviewJob.update({
-    where: { id: job.id },
-    data: { status: "processing", attempts: { increment: 1 } },
-  });
 
   let span: ReturnType<typeof startSpan> | undefined;
   let activeStage: StageTracker | undefined;

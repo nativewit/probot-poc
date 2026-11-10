@@ -100,15 +100,26 @@ async function createStuckReview(overrides: { state?: "queued" | "analyzing" | "
   return { reviewId: review.id, jobId: job.id };
 }
 
-function fakeQueue() {
+function fakeQueue(existingState?: "completed" | "failed" | "waiting" | "active" | "prioritized" | "delayed") {
   const added: Array<{ name: string; payload: ReviewJobPayload; opts: { jobId?: string; attempts?: number } }> = [];
+  const events: string[] = [];
   const queue = {
     add: async (name: string, payload: ReviewJobPayload, opts: { jobId?: string; attempts?: number } = {}) => {
+      events.push("add");
       added.push({ name, payload, opts });
       return { id: opts.jobId ?? "x" };
     },
+    getJob: async () => {
+      if (!existingState) return undefined;
+      return {
+        getState: async () => existingState,
+        remove: async () => {
+          events.push("remove");
+        },
+      };
+    },
   } as unknown as Queue<ReviewJobPayload>;
-  return { queue, added };
+  return { queue, added, events };
 }
 
 // Tests ----------------------------------------------------------------------
@@ -154,6 +165,45 @@ describe("reconciliation", () => {
       staleThresholdMs: 15 * 60_000,
     });
     expect(second.requeued).toBe(0);
+    expect(added).toHaveLength(1);
+  });
+
+  test("removes a retained completed job before re-enqueueing (no silent jobId dedupe)", async () => {
+    // Reproduces the race aftermath: the worker skipped the job and BullMQ
+    // retained it as `completed`. `queue.add` with the same jobId would be a
+    // no-op, so recovery must remove the finished job first or the review is
+    // stuck in a 15-minute stale→requeue loop that never runs anything.
+    const { jobId } = await createStuckReview({ state: "queued" });
+    const { queue, added, events } = fakeQueue("completed");
+
+    const summary = await reconcileIncompleteReviews({
+      prisma,
+      logger,
+      queue,
+      staleThresholdMs: 15 * 60_000,
+      maxJobAttempts: 3,
+    });
+
+    expect(summary.requeued).toBe(1);
+    expect(events).toEqual(["remove", "add"]);
+    expect(added).toHaveLength(1);
+    expect(added[0].opts.jobId).toBe(jobId);
+  });
+
+  test("does not remove an active job still owned by a worker", async () => {
+    await createStuckReview();
+    const { queue, added, events } = fakeQueue("active");
+
+    const summary = await reconcileIncompleteReviews({
+      prisma,
+      logger,
+      queue,
+      staleThresholdMs: 15 * 60_000,
+      maxJobAttempts: 3,
+    });
+
+    expect(summary.requeued).toBe(1);
+    expect(events).toEqual(["add"]);
     expect(added).toHaveLength(1);
   });
 

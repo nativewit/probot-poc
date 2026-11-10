@@ -8,7 +8,9 @@ import myProbotApp from "../src/index.js";
 import { getPrisma, disconnectPrisma } from "../src/lib/prisma.js";
 import { checkRedis, disconnectRedis } from "../src/lib/redis.js";
 import { closeReviewQueue, getReviewQueue, getQueueConnection } from "../src/ingestion/queue.js";
-import { recoverOutbox } from "../src/ingestion/outbox.js";
+import { publishOutboxEvent, recoverOutbox } from "../src/ingestion/outbox.js";
+import type { Queue } from "bullmq";
+import type { ReviewJobPayload } from "../src/ingestion/queue.js";
 import { ingestManualReview, getReviewStatus } from "../src/ingestion/orchestrator.js";
 import { transitionReviewState, InvalidStateTransitionError } from "../src/ingestion/review-state.js";
 import type { ReviewState } from "@prisma/client";
@@ -699,6 +701,104 @@ describe("transactional outbox recovery (§12.2)", () => {
       }
     }
   }, 60_000);
+});
+
+describe("outbox publish ordering", () => {
+  async function seedPendingJob(): Promise<{ jobId: string; eventId: string }> {
+    const headSha = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
+    const installation = await prisma.installation.create({
+      data: { githubInstallationId: BigInt(INSTALLATION_ID), organization: "octo-org" },
+    });
+    const repository = await prisma.repository.create({
+      data: {
+        githubRepositoryId: BigInt(REPOSITORY_ID),
+        installationId: installation.id,
+        fullName: REPO_FULL_NAME,
+        defaultBranch: "main",
+      },
+    });
+    const pullRequest = await prisma.pullRequest.create({
+      data: { repositoryId: repository.id, githubPrNumber: 77, headSha },
+    });
+    const review = await prisma.review.create({
+      data: {
+        pullRequestId: pullRequest.id,
+        githubInstallationId: BigInt(INSTALLATION_ID),
+        githubRepositoryId: BigInt(REPOSITORY_ID),
+        pullRequestNumber: 77,
+        headSha,
+        state: "queued",
+        trigger: "opened",
+      },
+    });
+    const job = await prisma.reviewJob.create({
+      data: { reviewId: review.id, status: "pending_outbox", jobKey: `outbox-order-${review.id}` },
+    });
+    const event = await prisma.outboxEvent.create({
+      data: {
+        reviewJobId: job.id,
+        type: "review.requested",
+        payload: {
+          reviewId: review.id,
+          jobKey: job.jobKey,
+          githubInstallationId: String(INSTALLATION_ID),
+          githubRepositoryId: String(REPOSITORY_ID),
+          repositoryFullName: REPO_FULL_NAME,
+          pullRequestNumber: 77,
+          headSha,
+          baseSha: null,
+          reviewMode: "adaptive",
+          reviewType: "standard",
+          trigger: "opened",
+          configurationHash: null,
+        },
+      },
+    });
+    return { jobId: job.id, eventId: event.id };
+  }
+
+  test("commits enqueued before the queue job becomes visible", async () => {
+    // Regression: publishing to Redis before the DB commit let a worker see
+    // `pending_outbox`, skip the job, and lose the review permanently.
+    const { jobId, eventId } = await seedPendingJob();
+    const statusAtAdd: string[] = [];
+    const queue = {
+      add: async (_name: string, _payload: ReviewJobPayload, opts: { jobId?: string } = {}) => {
+        const row = await prisma.reviewJob.findUniqueOrThrow({ where: { id: jobId } });
+        statusAtAdd.push(row.status);
+        expect(opts.jobId).toBe(jobId);
+        return { id: jobId };
+      },
+    } as unknown as Queue<ReviewJobPayload>;
+
+    await expect(publishOutboxEvent(eventId, queue)).resolves.toBe("published");
+
+    expect(statusAtAdd).toEqual(["enqueued"]);
+    const job = await prisma.reviewJob.findUniqueOrThrow({ where: { id: jobId } });
+    expect(job.status).toBe("enqueued");
+    expect(job.queueJobId).toBe(jobId);
+    const event = await prisma.outboxEvent.findUniqueOrThrow({ where: { id: eventId } });
+    expect(event.status).toBe("published");
+    expect(event.publishedAt).not.toBeNull();
+  });
+
+  test("restores pending_outbox and leaves the event pending when publish fails", async () => {
+    const { jobId, eventId } = await seedPendingJob();
+    const queue = {
+      add: async () => {
+        throw new Error("connect ECONNREFUSED 127.0.0.1:6379");
+      },
+    } as unknown as Queue<ReviewJobPayload>;
+
+    await expect(publishOutboxEvent(eventId, queue)).resolves.toBe("failed");
+
+    const job = await prisma.reviewJob.findUniqueOrThrow({ where: { id: jobId } });
+    expect(job.status).toBe("pending_outbox");
+    expect(job.queueJobId).toBeNull();
+    const event = await prisma.outboxEvent.findUniqueOrThrow({ where: { id: eventId } });
+    expect(event.status).toBe("pending");
+    expect(event.attempts).toBe(1);
+  });
 });
 
 // Helpers ---------------------------------------------------------------------

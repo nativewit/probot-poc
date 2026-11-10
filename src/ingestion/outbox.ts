@@ -82,13 +82,42 @@ export async function publishOutboxEvent(
 
     const payload = buildPayload(event, job);
     const retry = jobRetryOptions();
-    const queueJob = await queue.add("review", payload, {
-      jobId: job.id, // idempotent: same ReviewJob.id never enqueued twice
-      attempts: retry.attempts,
-      backoff: retry.backoff,
-      removeOnComplete: 1000,
-      removeOnFail: 5000,
+
+    // Commit the durable `enqueued` state BEFORE the job becomes visible to
+    // consumers. Adding to Redis first opens a race where an idle worker picks
+    // the job up while the row still says `pending_outbox`; the worker then
+    // skips it, BullMQ records the skip as success, and the review never runs.
+    // A failed publish is rolled back to `pending_outbox` below so the outbox
+    // event and job row stay consistent for recovery.
+    await prisma.reviewJob.update({
+      where: { id: job.id },
+      data: { status: "enqueued" },
     });
+
+    const queueJob = await (async () => {
+      try {
+        return await queue.add("review", payload, {
+          jobId: job.id, // idempotent: same ReviewJob.id never enqueued twice
+          attempts: retry.attempts,
+          backoff: retry.backoff,
+          removeOnComplete: 1000,
+          removeOnFail: 5000,
+        });
+      } catch (error) {
+        // Publish failed (e.g. Redis down): restore the durable pre-publish
+        // state so the outbox event and job row agree. The `queueJobId: null`
+        // guard keeps a concurrent successful publisher's state intact.
+        await prisma.reviewJob
+          .updateMany({
+            where: { id: job.id, status: "enqueued", queueJobId: null },
+            data: { status: "pending_outbox" },
+          })
+          .catch(() => {
+            /* Postgres may be unreachable too; recovery retries either way. */
+          });
+        throw error;
+      }
+    })();
 
     await prisma.$transaction([
       prisma.outboxEvent.update({
@@ -97,7 +126,7 @@ export async function publishOutboxEvent(
       }),
       prisma.reviewJob.update({
         where: { id: job.id },
-        data: { status: "enqueued", queueJobId: queueJob.id ?? job.id },
+        data: { queueJobId: queueJob.id ?? job.id },
       }),
     ]);
     return "published";

@@ -246,6 +246,20 @@ export async function reconcileIncompleteReviews(deps: ReconciliationDeps): Prom
           }
         : fallback;
 
+      // A terminal BullMQ job (completed/failed) with this id is retained by
+      // removeOnComplete/removeOnFail, and `queue.add` with an existing jobId
+      // is a silent no-op. Without clearing it, recovery would flip the review
+      // back to `enqueued` while nothing ever runs — a permanent stale→requeue
+      // loop. Only terminal jobs are removed; an active/waiting job still owns
+      // the work and must not be touched.
+      const existing = await queue.getJob(job.id);
+      if (existing) {
+        const state = await existing.getState();
+        if (state === "completed" || state === "failed") {
+          await existing.remove();
+        }
+      }
+
       await resetReviewForRecovery(prisma, review.id);
       await prisma.reviewJob.update({
         where: { id: job.id },
