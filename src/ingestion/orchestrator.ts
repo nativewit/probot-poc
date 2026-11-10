@@ -207,11 +207,19 @@ export async function ingestReviewRequest(input: IngestReviewRequestInput): Prom
       },
       update: {
         headSha: input.headSha,
-        baseSha: input.baseSha ?? null,
+        // Never clobber a known base SHA with null: manual `/review` ingestion
+        // has no base SHA, and wiping the stored one leaves the workspace with
+        // nothing to diff against.
+        baseSha: input.baseSha ?? undefined,
         draft: input.draft,
         status: "open",
       },
     });
+
+    // Manual `/review` requests carry no base SHA. Reuse the one captured from
+    // the original pull_request webhook so the review can still compute a diff
+    // (and so re-ingestion does not lose it again).
+    const resolvedBaseSha = input.baseSha ?? pullRequest.baseSha ?? null;
 
     // 2. Review identity (§12.3): one review per (PR, head SHA, mode), unless
     //    the request is forced (manual `/review` re-review), which raises the
@@ -272,7 +280,7 @@ export async function ingestReviewRequest(input: IngestReviewRequestInput): Prom
         githubRepositoryId: repositoryId,
         pullRequestNumber: input.pullRequestNumber,
         headSha: input.headSha,
-        baseSha: input.baseSha ?? null,
+        baseSha: resolvedBaseSha,
         state: "queued",
         trigger: input.trigger,
         reviewMode,
@@ -333,7 +341,7 @@ export async function ingestReviewRequest(input: IngestReviewRequestInput): Prom
           repositoryFullName: input.repositoryName,
           pullRequestNumber: input.pullRequestNumber,
           headSha: input.headSha,
-          baseSha: input.baseSha ?? null,
+          baseSha: resolvedBaseSha,
           reviewMode,
           reviewType,
           trigger: input.trigger,

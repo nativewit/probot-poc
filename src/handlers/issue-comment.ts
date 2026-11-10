@@ -127,10 +127,13 @@ export function registerIssueCommentHandlers(app: Probot): void {
       return;
     }
 
-    // Resolve head SHA: durable row first (fresh from open/synchronize), then
-    // the GitHub API as a fallback for PRs this app has never seen.
+    // Resolve base/head SHAs: durable row first (fresh from open/synchronize),
+    // then the GitHub API as a fallback for PRs this app has never seen. The
+    // base SHA is required to compute the diff; a `/review` comment payload
+    // does not carry it, so it must come from the row or the API.
     const prisma = getPrisma();
     let headSha: string | null = null;
+    let baseSha: string | null = null;
     let draft = issue.draft ?? false;
     const storedRepository = await prisma.repository
       .findUnique({ where: { githubRepositoryId: BigInt(repository.id) }, select: { id: true } })
@@ -139,14 +142,16 @@ export function registerIssueCommentHandlers(app: Probot): void {
       ? await prisma.pullRequest
           .findUnique({
             where: { repositoryId_githubPrNumber: { repositoryId: storedRepository.id, githubPrNumber: issue.number } },
-            select: { headSha: true, draft: true },
+            select: { headSha: true, baseSha: true, draft: true },
           })
           .catch(() => null)
       : null;
     if (stored?.headSha) {
       headSha = stored.headSha;
+      baseSha = stored.baseSha ?? null;
       draft = stored.draft;
-    } else {
+    }
+    if (!headSha || !baseSha) {
       try {
         const prResponse = await context.octokit.rest.pulls.get({
           owner: repository.owner.login,
@@ -154,10 +159,16 @@ export function registerIssueCommentHandlers(app: Probot): void {
           pull_number: issue.number,
         });
         headSha = prResponse.data.head.sha;
+        baseSha = prResponse.data.base.sha;
         draft = prResponse.data.draft ?? false;
       } catch (error) {
-        context.log.error({ err: error, pr: issue.number }, "Could not resolve pull request head SHA; /review ignored");
-        return;
+        if (!headSha) {
+          context.log.error({ err: error, pr: issue.number }, "Could not resolve pull request head SHA; /review ignored");
+          return;
+        }
+        // Head is known; continue without a base SHA rather than dropping the
+        // command. The worker falls back to the repository default branch.
+        context.log.warn({ err: error, pr: issue.number }, "Could not resolve pull request base SHA; using default branch fallback");
       }
     }
     if (!headSha) return;
@@ -176,7 +187,7 @@ export function registerIssueCommentHandlers(app: Probot): void {
         defaultBranch: repository.default_branch,
         pullRequestNumber: issue.number,
         headSha,
-        baseSha: null,
+        baseSha,
         draft,
         deliveryId: context.id,
         deliveryEvent: "issue_comment.created",

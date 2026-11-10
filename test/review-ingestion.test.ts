@@ -398,6 +398,22 @@ describe("review ingestion", () => {
     expect(manualJob.jobKey).toBe(`${INSTALLATION_ID}:${REPOSITORY_ID}:42:aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111:adaptive:standard:a1`);
   });
 
+  test("/review reuses the stored base SHA instead of nulling it", async () => {
+    // Regression: the issue_comment payload has no base SHA, and ingestion used
+    // to overwrite the PR's stored base SHA with null — the review then failed
+    // at clone with "Could not resolve base commit (baseSha=unknown)".
+    const baseSha = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
+    await receiveDelivery(probot, "pull_request", "opened", pullRequestPayload("opened"), "delivery-base-open-1");
+    await receiveDelivery(probot, "issue_comment", "created", commentPayload("/review"), "delivery-base-1");
+
+    const pullRequest = await prisma.pullRequest.findFirstOrThrow();
+    expect(pullRequest.baseSha).toBe(baseSha);
+    const opened = await prisma.review.findFirstOrThrow({ where: { trigger: "opened" } });
+    expect(opened.baseSha).toBe(baseSha);
+    const manual = await prisma.review.findFirstOrThrow({ where: { trigger: "manual" } });
+    expect(manual.baseSha).toBe(baseSha);
+  });
+
   test("repeated /review comments create one fresh review per command", async () => {
     await receiveDelivery(probot, "pull_request", "opened", pullRequestPayload("opened"), "delivery-cmd-open-2");
     await receiveDelivery(probot, "issue_comment", "created", commentPayload("/review"), "delivery-cmd-2");

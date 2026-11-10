@@ -123,14 +123,26 @@ export async function processReviewJob(
 
     const cloneStage = startStage(reviewLogger, "clone");
     activeStage = cloneStage;
+    // Base commit resolution: prefer the exact base SHA captured at ingestion.
+    // Manual `/review` requests (and older jobs) may have none, so fall back to
+    // the repository's default branch instead of failing the clone outright.
+    const baseSha = payload.baseSha ?? job.review.baseSha ?? null;
+    const repository = baseSha
+      ? null
+      : await prisma.repository.findUnique({
+          where: { githubRepositoryId: job.review.githubRepositoryId },
+          select: { defaultBranch: true },
+        });
+    const baseRef = baseSha ? null : repository?.defaultBranch ?? null;
+
     const workspace = await deps.service.prepare({
       reviewId: job.reviewId,
       repositoryFullName: payload.repositoryFullName,
       installationId: BigInt(payload.githubInstallationId),
       pullRequestNumber: payload.pullRequestNumber,
       headSha: payload.headSha,
-      baseSha: payload.baseSha ?? job.review.baseSha ?? null,
-      baseRef: null,
+      baseSha,
+      baseRef,
     });
     cloneStage.end();
     activeStage = undefined;

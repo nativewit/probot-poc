@@ -535,6 +535,37 @@ describe("worker processor", () => {
     expect(await prisma.reviewWorkspace.count({ where: { reviewId: chain.reviewId } })).toBe(0);
   });
 
+  test("falls back to the repository default branch when base SHA is unknown", async () => {
+    // Manual reviews previously carried no base SHA and failed before cloning.
+    // With neither baseSha nor a payload baseRef, the worker must use the
+    // repository's default branch to compute the diff.
+    const { service } = makeService();
+    const chain = await createReviewChain();
+    await prisma.review.update({ where: { id: chain.reviewId }, data: { baseSha: null } });
+    let prepared = 0;
+    const outcome = await processReviewJob(chain.jobId, {
+      reviewId: chain.reviewId,
+      jobKey: "k",
+      githubInstallationId: INSTALLATION_ID.toString(),
+      githubRepositoryId: "12345",
+      repositoryFullName: REPO_FULL_NAME,
+      pullRequestNumber: PR_NUMBER,
+      headSha,
+      baseSha: null,
+      reviewMode: "standard",
+      trigger: "manual",
+    }, {
+      ...makeDeps(service, silentLogger),
+      onWorkspacePrepared: async ({ workspace }) => {
+        prepared += 1;
+        expect(workspace.baseSha).toBeTruthy();
+      },
+    });
+
+    expect(outcome).toBe("processed");
+    expect(prepared).toBe(1);
+  });
+
   test("processing failure marks job + review failed and cleans up", async () => {
     const { service } = makeService({ cloneUrlBuilder: () => path.join(fixtureDir, "missing.git") });
     const chain = await createReviewChain();
