@@ -16,7 +16,9 @@ import {
   updateReviewConfig,
   validateRawConfig,
 } from "../config/review-loader.js";
-import { getReviewStatus } from "../ingestion/orchestrator.js";
+import { getReviewStatus, ingestManualReview, ManualIngestionError, REVIEW_TYPES, type ReviewTypeValue } from "../ingestion/orchestrator.js";
+import { summarizeKnowledgeMetrics, summarizeKnowledgeSnapshot } from "../knowledge/index.js";
+import { z } from "zod";
 import {
   buildAuthorizeUrl,
   exchangeOAuthCode,
@@ -195,6 +197,14 @@ export function authorizeAdmin(
 // ---------------------------------------------------------------------------
 
 const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+// Review types (§4.1): body schema for POST /api/admin/reviews/trigger.
+const triggerReviewBodySchema = z.object({
+  repository: z.string().regex(/^[^/\s]+\/[^/\s]+$/, "must be 'owner/repo'"),
+  pullRequestNumber: z.number().int().min(1).max(1_000_000),
+  /** Which review methodology runs; defaults to github.defaultReviewType. */
+  reviewType: z.enum(REVIEW_TYPES).optional(),
+});
 
 function headerValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
@@ -393,6 +403,18 @@ export function createAdminApi(deps: AdminApiDeps): (req: IncomingMessage, res: 
 
     if (req.method === "GET" && path === "/api/admin/reviews") {
       await handleListReviews(ctx);
+      return;
+    }
+
+    // --- Review types (§4.1): on-demand triggering + per-type comparison ---
+
+    if (req.method === "POST" && path === "/api/admin/reviews/trigger") {
+      await handleTriggerReview(ctx, session);
+      return;
+    }
+
+    if (req.method === "GET" && path === "/api/admin/reviews/compare") {
+      await handleCompareReviews(ctx);
       return;
     }
 
@@ -634,5 +656,165 @@ export function createAdminApi(deps: AdminApiDeps): (req: IncomingMessage, res: 
       return;
     }
     sendJson(res, 200, report);
+  }
+
+  // -------------------------------------------------------------------------
+  // Review types (§4.1): on-demand triggering + comparison
+  // -------------------------------------------------------------------------
+
+  /** POST /api/admin/reviews/trigger — manual ingestion for one review type. */
+  async function handleTriggerReview(ctx: AdminRequestContext, session: AdminSession): Promise<void> {
+    const body = await readJsonBody(ctx.req);
+    const parsed = triggerReviewBodySchema.safeParse(body);
+    if (!parsed.success) {
+      sendJson(ctx.res, 400, {
+        error: "invalid request",
+        details: parsed.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),
+      });
+      return;
+    }
+    // Respect the configured default when no type is supplied, and refuse
+    // disabled types with a clear error (§4.1).
+    let reviewType: ReviewTypeValue;
+    try {
+      const { config } = loadReviewConfig(configPath, { env: processEnv, allowLastKnownGoodFallback: true });
+      reviewType = parsed.data.reviewType ?? config.github.defaultReviewType;
+      const settings = config.review.types[reviewType];
+      if (settings && settings.enabled === false) {
+        sendJson(ctx.res, 409, { error: `review type '${reviewType}' is disabled` });
+        return;
+      }
+    } catch (error) {
+      deps.logger.warn({ err: (error as Error).message }, "Configuration unavailable for review trigger; defaulting type");
+      reviewType = parsed.data.reviewType ?? "standard";
+    }
+    try {
+      const result = await ingestManualReview({ ...parsed.data, reviewType });
+      await audit(session.login, "review.trigger", "review", {
+        repository: parsed.data.repository,
+        pullRequestNumber: parsed.data.pullRequestNumber,
+        reviewType,
+        outcome: result.outcome,
+        reviewId: result.reviewId,
+      });
+      sendJson(ctx.res, result.outcome === "created" ? 202 : 200, { ...result, reviewType });
+    } catch (error) {
+      if (error instanceof ManualIngestionError) {
+        sendJson(ctx.res, 404, { error: error.message });
+        return;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * GET /api/admin/reviews/compare?repository=owner/repo&pr=123
+   *
+   * Per-type comparison rows for one PR (§4.1): review id, type, state,
+   * attempt, trigger, timestamps, duration, finding counts by severity,
+   * findings unique to this type (fingerprint not present in any other
+   * type's review of the same commit) and persisted token usage (null when
+   * the run predates token persistence).
+   */
+  async function handleCompareReviews(ctx: AdminRequestContext): Promise<void> {
+    const repositoryName = ctx.url.searchParams.get("repository");
+    const prRaw = Number(ctx.url.searchParams.get("pr"));
+    if (!repositoryName || !/^[^/\s]+\/[^/\s]+$/.test(repositoryName) || !Number.isInteger(prRaw) || prRaw < 1) {
+      sendJson(ctx.res, 400, { error: "repository ('owner/repo') and pr (integer) query parameters are required" });
+      return;
+    }
+
+    const repository = await deps.prisma.repository.findUnique({ where: { fullName: repositoryName } });
+    if (!repository) {
+      sendJson(ctx.res, 404, { error: `repository '${repositoryName}' is not registered` });
+      return;
+    }
+    const pullRequest = await deps.prisma.pullRequest.findUnique({
+      where: { repositoryId_githubPrNumber: { repositoryId: repository.id, githubPrNumber: prRaw } },
+    });
+    if (!pullRequest) {
+      sendJson(ctx.res, 404, { error: `pull request #${prRaw} not found on '${repositoryName}'` });
+      return;
+    }
+
+    const reviews = await deps.prisma.review.findMany({
+      where: { pullRequestId: pullRequest.id },
+      orderBy: { createdAt: "desc" },
+      include: { findings: { select: { fingerprint: true, severity: true } } },
+    });
+
+    // Fingerprints seen by each review TYPE of the same PR/head SHA — used
+    // to compute per-type unique findings (a fingerprint another type did
+    // not report). A review's own type never counts against it.
+    const fingerprintsByType = new Map<string, Map<string, Set<string>>>();
+    for (const review of reviews) {
+      let bySha = fingerprintsByType.get(review.reviewType);
+      if (!bySha) {
+        bySha = new Map<string, Set<string>>();
+        fingerprintsByType.set(review.reviewType, bySha);
+      }
+      let set = bySha.get(review.headSha);
+      if (!set) {
+        set = new Set<string>();
+        bySha.set(review.headSha, set);
+      }
+      for (const finding of review.findings) set.add(finding.fingerprint);
+    }
+
+    const rows = reviews.map((review) => {
+      const severityCounts: Record<string, number> = {};
+      for (const finding of review.findings) {
+        severityCounts[finding.severity] = (severityCounts[finding.severity] ?? 0) + 1;
+      }
+      const fingerprints = new Set(review.findings.map((f) => f.fingerprint));
+      const others = new Set<string>();
+      for (const [type, bySha] of fingerprintsByType) {
+        if (type === review.reviewType) continue;
+        for (const fingerprint of bySha.get(review.headSha) ?? []) others.add(fingerprint);
+      }
+      let uniqueCount = 0;
+      for (const fingerprint of fingerprints) {
+        if (!others.has(fingerprint)) uniqueCount += 1;
+      }
+      const completedAt = review.completedAt ?? null;
+      const durationMs =
+        review.startedAt && completedAt ? completedAt.getTime() - review.startedAt.getTime() : null;
+      return {
+        id: review.id,
+        reviewType: review.reviewType,
+        reviewMode: review.reviewMode,
+        state: review.state,
+        attempt: review.attempt,
+        trigger: review.trigger,
+        headSha: review.headSha,
+        createdAt: review.createdAt,
+        startedAt: review.startedAt,
+        completedAt,
+        durationMs,
+        publishSkipped: review.publishSkipped,
+        findingCount: review.findings.length,
+        severityCounts,
+        uniqueFindings: uniqueCount,
+        inputTokens: review.inputTokens,
+        outputTokens: review.outputTokens,
+        // Knowledge snapshot identity per review (§4/§16.1, additive): the
+        // ref + content hash each type's injection actually ran with, so
+        // comparisons can show e.g. "handbook@<sha7>".
+        knowledgeSnapshot: summarizeKnowledgeSnapshot(review.knowledgeSnapshot),
+        // Injection metrics per review (§16.1, additive): estimated injected
+        // tokens + the retrieval funnel (candidates → relevant → selected)
+        // and whether the token budget forced truncation. Null when the
+        // review predates metrics or ran without knowledge injection.
+        knowledgeMetrics: summarizeKnowledgeMetrics(review.knowledgeSnapshot),
+        errorCode: review.errorCode,
+      };
+    });
+
+    sendJson(ctx.res, 200, {
+      repository: repositoryName,
+      pullRequestNumber: prRaw,
+      headShas: [...new Set(reviews.map((r) => r.headSha))],
+      reviews: rows,
+    });
   }
 }

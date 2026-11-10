@@ -1,0 +1,76 @@
+/**
+ * Knowledge source types (boot-time initialization).
+ *
+ * Knowledge sources are fetched ONCE per worker boot into a persistent cache
+ * and are treated as UNTRUSTED DATA: fetched content is injected into review
+ * prompts as text, never executed, never interpreted as configuration, and
+ * never written outside the knowledge cache directory or a review's own
+ * workspace copy (§10 security invariant).
+ */
+
+/** status "fresh": fetched from GitHub; "bundled": shipped fallback copy; "unavailable": no content. */
+export type KnowledgeSourceStatus = "fresh" | "bundled" | "unavailable";
+
+/** One cached knowledge file. Paths are cache-relative and pre-validated. */
+export interface KnowledgeFileRecord {
+  path: string;
+  sha256: string;
+  bytes: number;
+}
+
+/** Resolved state of one knowledge source for this worker boot. */
+export interface KnowledgeSourceSnapshot {
+  status: KnowledgeSourceStatus;
+  /** Pinned commit SHA (skill) or resolved commit SHA / "bundled" (handbook). */
+  ref: string;
+  /** sha256 over the sorted per-file hashes ("path sha256\n" lines); null when unavailable. */
+  contentHash: string | null;
+  /** Cache directory holding this source's files (null when unavailable). */
+  dir: string | null;
+  files: KnowledgeFileRecord[];
+}
+
+/** Knowledge snapshot resolved at worker boot, shared by all reviews. */
+export interface KnowledgeSnapshot {
+  cacheDir: string;
+  skill: KnowledgeSourceSnapshot;
+  handbook: KnowledgeSourceSnapshot;
+}
+
+/**
+ * Injectable HTTP fetcher for knowledge sources (test seam — no real network
+ * in CI). Must resolve with a status code and body text, never throw for
+ * HTTP-level failures (non-2xx is expressed via status).
+ */
+export type KnowledgeFetcher = (
+  url: string,
+  init?: { timeoutMs: number },
+) => Promise<{ status: number; text: string }>;
+
+/** Per-source identity persisted on the Review row (reproducibility, §4). */
+export interface PersistedKnowledgeSource {
+  ref: string;
+  status: KnowledgeSourceStatus;
+  contentHash: string;
+  files: KnowledgeFileRecord[];
+}
+
+/** Shape of the Review.knowledgeSnapshot JSON column (nullable). */
+export interface PersistedKnowledgeSnapshot {
+  skill?: PersistedKnowledgeSource;
+  handbook?: PersistedKnowledgeSource;
+  /**
+   * Per-review injection metrics (§16.1, additive): token budget usage and
+   * the selection funnel. Written by the pipeline after injection resolves.
+   */
+  metrics?: {
+    /** Which source the metrics describe. */
+    source: "skill" | "handbook";
+    injectedTokens: number;
+    documentsRetrieved: number;
+    candidates: number;
+    relevant: number;
+    selected: number;
+    truncated: boolean;
+  };
+}

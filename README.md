@@ -158,7 +158,35 @@ from the environment.
 3. Open a pull request (or push a new commit to one). A review job is queued and
    results appear as a PR summary plus inline comments.
 4. Comment `/review` on a PR to trigger a manual review. Draft PRs are skipped
-   by default.
+   by default. The command accepts a review type:
+   `/review` (default `standard`), `/review type:skill` (playbook-injected
+   methodology) and `/review type:handbook` (standards pulled from the
+   configured handbook repo). All types review the same commit independently;
+   by default only `standard` posts findings back to GitHub
+   (`review.types.<type>.publish`), the others persist results for
+   comparison (`GET /api/admin/reviews/compare`).
+
+### Knowledge sources (skill playbook / handbook)
+
+The skill playbook and the engineering handbook are fetched ONCE per worker boot
+into a persistent cache (`KNOWLEDGE_CACHE_DIR`, default `<workspaces-root>/knowledge`)
+— never per review. Refs should be pinned commit SHAs in prod via
+`KNOWLEDGE_SKILL_REF` / `KNOWLEDGE_HANDBOOK_REF` (they override
+`knowledge.skill.ref` / `knowledge.handbook.ref` in `config/review.json`; a branch
+name is resolved to its current commit SHA at boot). Optional bearer token:
+`KNOWLEDGE_GITHUB_TOKEN` (or `GITHUB_TOKEN`) for private handbook repos. If a fetch
+fails the worker still starts: the skill falls back to the bundled
+`config/skills/code-review.md`, handbook reviews fail fast. Each review persists the
+exact knowledge snapshot it started with (`Review.knowledgeSnapshot`) and injects
+from its own workspace copy, so cache refreshes never alter an in-flight review; the
+comparison endpoint reports the per-source ref + content hash plus the additive
+`knowledgeMetrics` (estimated injected tokens, retrieval funnel, truncation flag).
+Injection budgets are token-based (`knowledge.skill.maxTokens` default 1500,
+`knowledge.handbook.maxTokens` default 3000, ≈4 chars/token; `maxChars` is a
+byte-level backstop). The handbook instruction profile lives in
+`src/review-engine/prompts/handbook-review.ts`; retrieval (technology detection,
+ranking, dedup, deterministic selection) is application-side — the agent never
+retrieves knowledge itself.
 
 Review behavior (categories, confidence thresholds, execution policy, model,
 etc.) lives in [`config/review.json`](config/review.json). It is baked into the

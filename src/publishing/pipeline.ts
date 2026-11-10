@@ -26,7 +26,9 @@ import type { ReviewJobPayload } from "../ingestion/queue.js";
 import type { WorkspaceResult } from "../workspace/workspace.js";
 import type { InstallationTokenProvider } from "../workspace/credentials.js";
 import { createReviewEngineHook } from "../review-engine/hook.js";
+import { resolveReviewInjection } from "../review-engine/injection.js";
 import type { RunReviewOutput } from "../review-engine/types.js";
+import { getKnowledgeSnapshot, materializeReviewKnowledge, persistKnowledgeMetrics } from "../knowledge/index.js";
 import { persistReviewFindings } from "../findings/index.js";
 import {
   StaleHeadError,
@@ -73,7 +75,7 @@ export async function finalizeReview(
   // verification needs the checked-out files; cleanup happens afterwards.
   const review = await prisma.review.findUnique({
     where: { id: reviewId },
-    select: { id: true, pullRequest: { select: { repositoryId: true } } },
+    select: { id: true, reviewType: true, pullRequest: { select: { repositoryId: true } } },
   });
   if (!review) {
     throw new Error(`Review '${reviewId}' not found for findings persistence`);
@@ -112,6 +114,26 @@ export async function finalizeReview(
       head_sha: workspace.headSha,
     }),
   });
+
+  // Publishing gate (decision 7): only review types whose
+  // review.types.<type>.publish flag is true post to GitHub. Experimental
+  // types (skill/handbook by default) run, persist findings and complete —
+  // the skip is recorded on the review row (publishSkipped) and logged.
+  const typeSettings = deps.config.review.types[review.reviewType as keyof typeof deps.config.review.types];
+  const publishable = typeSettings ? typeSettings.publish : review.reviewType === "standard";
+  if (!publishable) {
+    logger.info(
+      { reviewId, reviewType: review.reviewType },
+      "Publishing gate: review type is not publishable; findings persisted but GitHub publication skipped",
+    );
+    await prisma.review.update({ where: { id: reviewId }, data: { publishSkipped: true } }).catch(() => {
+      /* row gone — ignore */
+    });
+    await transitionReviewState(reviewId, "completed");
+    endSpan(publishSpan);
+    logger.info({ reviewId, outcome: "publish_skipped" }, "Review pipeline completed (publication skipped by type gate)");
+    return;
+  }
 
   try {
     const token = await deps.tokenProvider.getInstallationToken(
@@ -155,6 +177,19 @@ export async function finalizeReview(
       logger,
     });
 
+    // Persist aggregate token usage (§16.1 comparison endpoint).
+    await prisma.review
+      .update({
+        where: { id: reviewId },
+        data: {
+          inputTokens: output.meta.usage.totalInputTokens,
+          outputTokens: output.meta.usage.totalOutputTokens,
+        },
+      })
+      .catch(() => {
+        /* best-effort metrics */
+      });
+
     await transitionReviewState(reviewId, "completed");
     endSpan(publishSpan);
     logger.info({ reviewId, outcome: publish.outcome }, "Review pipeline completed");
@@ -190,8 +225,56 @@ export function createReviewPipelineHook(deps: ReviewPipelineDeps): ReviewPipeli
   const engineHook = createReviewEngineHook(deps);
 
   return async (ctx) => {
+    const reviewType = ctx.payload.reviewType ?? "standard";
+    // Review-type injection (§4.1): skill loads the playbook, handbook uses
+    // the engineering handbook. Both run BEFORE the engine so missing
+    // content fails the review fast (SKILL_PLAYBOOK_UNAVAILABLE /
+    // HANDBOOK_UNCONFIGURED) instead of silently comparing against a
+    // degraded standard review.
+    //
+    // Per-review reproducibility (§4): the review's OWN knowledge snapshot
+    // copy is materialized into the workspace and its identity persisted on
+    // the Review row; injection reads only those copies, never the shared
+    // cache, so a worker restart refreshing the cache cannot change an
+    // in-flight review.
+    let promptInjection = null;
+    if (reviewType !== "standard") {
+      const materialized = await materializeReviewKnowledge({
+        reviewId: ctx.payload.reviewId,
+        reviewType,
+        workspacePath: ctx.workspace.workspacePath,
+        snapshot: getKnowledgeSnapshot(),
+        prisma: deps.prisma,
+        logger: deps.logger,
+      });
+      promptInjection = await resolveReviewInjection({
+        reviewType,
+        config: deps.config,
+        changedFiles: ctx.workspace.changedFiles.map((file) => file.path),
+        knowledgeDir: materialized.knowledgeDir,
+        snapshot: materialized.snapshot,
+        logger: deps.logger,
+      });
+      // Per-review knowledge metrics (§16.1, additive): the retrieval
+      // funnel + estimated injected tokens, persisted on the Review row's
+      // knowledgeSnapshot JSON. Best-effort — a metrics write failure must
+      // never fail the review.
+      if (promptInjection?.metrics) {
+        await persistKnowledgeMetrics(
+          deps.prisma,
+          ctx.payload.reviewId,
+          promptInjection.profile,
+          promptInjection.metrics,
+        ).catch((error) => {
+          deps.logger.warn(
+            { reviewId: ctx.payload.reviewId, err: redactCredentials(error instanceof Error ? error.message : String(error)) },
+            "Failed to persist knowledge injection metrics (non-fatal)",
+          );
+        });
+      }
+    }
     // Engine run + state up to `validating` (ticket 07 hook).
-    const output = await engineHook(ctx);
+    const output = await engineHook({ ...ctx, promptInjection });
     await finalizeReview(deps, ctx, output);
     return output;
   };

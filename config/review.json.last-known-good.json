@@ -11,9 +11,11 @@
     "events": [
       "opened",
       "synchronize",
-      "ready_for_review"
+      "ready_for_review",
+      "issue_comment"
     ],
     "manualCommand": "/review",
+    "defaultReviewType": "standard",
     "draftPullRequests": {
       "enabled": false
     },
@@ -47,6 +49,25 @@
       "apiCompatibility": true,
       "maintainability": true,
       "testing": true
+    },
+    "types": {
+      "standard": {
+        "enabled": true,
+        "publish": true
+      },
+      "skill": {
+        "enabled": true,
+        "publish": false,
+        "playbookPath": "config/skills/code-review.md"
+      },
+      "handbook": {
+        "enabled": true,
+        "publish": false,
+        "repository": "",
+        "branch": "main",
+        "path": "",
+        "maxChars": 20000
+      }
     },
     "severity": [
       "critical",
@@ -164,6 +185,26 @@
       "maxFilesPerReview": 2000
     }
   },
+  "knowledge": {
+    "cacheDir": "",
+    "fetchTimeoutMs": 30000,
+    "skill": {
+      "repo": "vercel-labs/open-agents",
+      "ref": "cf865e94de7729751c747171785b6ce57e7b178c",
+      "skillDir": ".agents/skills/code-review",
+      "bundledFallback": "config/skills/code-review.md",
+      "maxBytes": 200000,
+      "maxTokens": 1500
+    },
+    "handbook": {
+      "repo": "nativewit/engineering-handbook",
+      "ref": "main",
+      "path": "",
+      "maxBytes": 2000000,
+      "maxTokens": 3000,
+      "maxChars": 20000
+    }
+  },
   "queue": {
     "concurrency": 1,
     "newCommitPolicy": "supersede",
@@ -211,6 +252,10 @@
     },
     "tracing": {
       "enabled": true
+    },
+    "langfuse": {
+      "enabled": true,
+      "plugin": "@langfuse/opencode-observability-plugin@0.7.0"
     },
     "alerts": {
       "reviewFailure": true,

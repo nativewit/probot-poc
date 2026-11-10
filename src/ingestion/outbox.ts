@@ -35,6 +35,7 @@ function buildPayload(event: OutboxEvent, job: ReviewJob): ReviewJobPayload {
     headSha: payload.headSha ?? "",
     baseSha: payload.baseSha ?? null,
     reviewMode: payload.reviewMode ?? "adaptive",
+    reviewType: payload.reviewType ?? "standard",
     trigger: payload.trigger ?? "opened",
     configurationHash: payload.configurationHash ?? null,
   };

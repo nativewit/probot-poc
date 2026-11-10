@@ -20,6 +20,9 @@ const nonNegativeInt = z.number().int().min(0);
 
 const percentSchema = z.number().min(0).max(1);
 
+/** Review types (§4.1): standard (default), skill, handbook. */
+const reviewTypeOptions = z.enum(["standard", "skill", "handbook"]);
+
 const envVarName = z
   .string()
   .regex(/^[A-Z_][A-Z0-9_]*$/, "must be an environment variable NAME (e.g. CLOUDFLARE_API_KEY), not a secret value");
@@ -45,6 +48,8 @@ const githubSchema = z.object({
     .min(1)
     .default(["opened", "synchronize", "ready_for_review"]),
   manualCommand: z.string().min(2).max(32).default("/review"),
+  /** Which review type a bare `/review` (and POST /api/reviews) triggers. */
+  defaultReviewType: reviewTypeOptions.default("standard"),
   draftPullRequests: z
     .object({
       enabled: z.boolean().default(false),
@@ -76,6 +81,51 @@ const categoriesSchema = z
   })
   .prefault({});
 
+/**
+ * Review types (ARCHITECTURE.md §4.1): on-demand review methodologies that
+ * can be compared against the same PR/head SHA.
+ * - `standard` — the existing adaptive engine and instructions (the default).
+ * - `skill` — same engine, plus a code-review playbook injected into the
+ *   review instructions (config/skills/code-review.md by default).
+ * - `handbook` — same engine, plus relevant standards/conventions injected
+ *   from the boot-time knowledge cache (see the `knowledge` section below);
+ *   per review the content is pinned via the Review.knowledgeSnapshot.
+ *
+ * `publish` is the decision-7 gate: only types whose flag is true post to
+ * GitHub; the others run, persist findings and still reach a terminal state
+ * (publishSkipped records that publication was intentionally skipped).
+ */
+const reviewTypesSchema = z.object({
+  standard: z
+    .object({
+      enabled: z.boolean().default(true),
+      publish: z.boolean().default(true),
+    })
+    .prefault({}),
+  skill: z
+    .object({
+      enabled: z.boolean().default(true),
+      publish: z.boolean().default(false),
+      /** Repository-relative path of the playbook markdown file. */
+      playbookPath: z.string().min(1).max(500).default("config/skills/code-review.md"),
+    })
+    .prefault({}),
+  handbook: z
+    .object({
+      enabled: z.boolean().default(true),
+      publish: z.boolean().default(false),
+      /** Handbook repository as "owner/repo". Empty = not configured. */
+      repository: z.string().max(200).default(""),
+      /** Branch/ref to read the handbook from. */
+      branch: z.string().min(1).max(200).default("main"),
+      /** Optional subdirectory or single file inside the handbook repo (legacy). */
+      path: z.string().max(500).default(""),
+      /** Character budget for the injected handbook excerpt (legacy; knowledge.handbook.maxChars is canonical). */
+      maxChars: z.number().int().min(500).max(100_000).default(20_000),
+    })
+    .prefault({}),
+}).prefault({});
+
 const reviewSchema = z.object({
   enabled: z.boolean().default(true),
   triggers: z
@@ -92,6 +142,7 @@ const reviewSchema = z.object({
     })
     .prefault({}),
   categories: categoriesSchema,
+  types: reviewTypesSchema,
   severity: z
     .array(z.enum(["critical", "high", "medium", "low", "informational"]))
     .min(1)
@@ -271,6 +322,64 @@ const persistenceSchema = z.object({
   artifactRetentionDays: nonNegativeInt.max(3650).default(30),
 });
 
+/**
+ * Knowledge sources (boot-time initialization): the code-review skill
+ * playbook and the engineering handbook are fetched ONCE per worker boot
+ * into a persistent cache (never per review). Per-review reproducibility is
+ * achieved by copying the resolved files into each review's workspace and
+ * persisting the snapshot identity on the Review row (§4).
+ *
+ * `ref` should be a pinned commit SHA. Prod MUST pin via env overrides
+ * (KNOWLEDGE_SKILL_REF / KNOWLEDGE_HANDBOOK_REF); a branch name is resolved
+ * to its current commit SHA at boot so the cache/snapshot identity is still
+ * SHA-keyed.
+ */
+const knowledgeSchema = z.object({
+  /** Persistent cache directory. Empty = resolved at boot (env/default). */
+  cacheDir: z.string().max(500).default(""),
+  /** Per-source fetch deadline (covers all retry attempts). */
+  fetchTimeoutMs: nonNegativeInt.max(120_000).default(30_000),
+  skill: z
+    .object({
+      /** Source repository as "owner/repo". */
+      repo: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'must be "owner/repo"').default("vercel-labs/open-agents"),
+      /** Pinned commit SHA (or tag resolved to a SHA at boot). */
+      ref: z.string().min(1).max(200).default("cf865e94de7729751c747171785b6ce57e7b178c"),
+      /** Directory inside the repo holding the skill markdown. */
+      skillDir: z.string().max(500).default(".agents/skills/code-review"),
+      /** Bundled fallback used when the fetch fails (worker never crashes). */
+      bundledFallback: z.string().max(500).default("config/skills/code-review.md"),
+      /** Total byte budget for the fetched skill content. */
+      maxBytes: nonNegativeInt.max(10_000_000).default(200_000),
+      /**
+       * Token budget for the injected skill playbook (§4.1, ≈4 chars/token).
+       * Separate from, and usually much smaller than, the handbook budget.
+       */
+      maxTokens: z.number().int().min(250).max(20_000).default(1_500),
+    })
+    .prefault({}),
+  handbook: z
+    .object({
+      /** Source repository as "owner/repo". Empty disables handbook reviews. */
+      repo: z.string().max(200).default("nativewit/engineering-handbook"),
+      /** Ref to read from; branch names are resolved to a SHA at boot. */
+      ref: z.string().min(1).max(200).default("main"),
+      /** Subdirectory (repo root recursively when empty). */
+      path: z.string().max(500).default(""),
+      /** Total byte budget for the fetched handbook content. */
+      maxBytes: nonNegativeInt.max(50_000_000).default(2_000_000),
+      /**
+       * Token budget for the injected handbook guidelines (§4.1, retrieval
+       * layer; ≈4 chars/token). The per-stage instruction overhead is fixed
+       * and separate. `maxChars` below remains a byte-level backstop.
+       */
+      maxTokens: z.number().int().min(500).max(20_000).default(3_000),
+      /** Character budget backstop for the injected handbook excerpt. */
+      maxChars: z.number().int().min(500).max(100_000).default(20_000),
+    })
+    .prefault({}),
+}).prefault({});
+
 const repositoryOverridesSchema = z.object({
   enabled: z.boolean().default(true),
   allowedSections: z
@@ -346,6 +455,7 @@ export const reviewConfigSchema = z
     provider: providerSchema,
     execution: executionSchema.prefault({}),
     repository: repositorySchema.prefault({}),
+    knowledge: knowledgeSchema,
     queue: queueSchema.prefault({}),
     persistence: persistenceSchema.prefault({}),
     configuration: configurationSchema.prefault({}),

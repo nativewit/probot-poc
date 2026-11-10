@@ -186,6 +186,59 @@ export type RunReviewOutput = {
 };
 
 // ---------------------------------------------------------------------------
+// Prompt injection (§4.1) — instruction profiles + retrieval metrics
+// ---------------------------------------------------------------------------
+
+/**
+ * Selection/retrieval funnel metrics for one review's knowledge injection
+ * (persisted on Review.knowledgeSnapshot.metrics and surfaced by the
+ * comparison endpoint). Token counts are ESTIMATES (≈4 chars/token).
+ */
+export interface KnowledgeInjectionMetrics {
+  /** Estimated tokens of the injected guidelines text (≈4 chars/token). */
+  injectedTokens: number;
+  /** Handbook/skill files that actually contributed injected content. */
+  documentsRetrieved: number;
+  /** Files considered (all handbook files in the snapshot). */
+  candidates: number;
+  /** Files ranked relevant to the PR's detected technologies/paths. */
+  relevant: number;
+  /** Files finally selected under the token budget. */
+  selected: number;
+  /** True when the budget forced content to be dropped. */
+  truncated: boolean;
+}
+
+/**
+ * Review-type injection resolved by the pipeline BEFORE the engine runs
+ * (§4.1). The engine composes each stage's instruction from the trusted
+ * instruction profile plus this injection:
+ * - stage 1 (analysis) receives the FULL guidelines text (`text`) once;
+ * - later stages receive `laterStagesText` — the profile instructions plus a
+ *   tiny digest — instead of re-injecting the full block.
+ */
+export interface PromptInjection {
+  /** Short label used in the instruction header and logs. */
+  label: string;
+  /** Which trusted instruction profile the engine composes with. */
+  profile: "skill" | "handbook";
+  /** Full methodology/guidelines text injected into the analysis stage. */
+  text: string;
+  /**
+   * Compact replacement for later stages (investigation/reporting): trusted
+   * profile instructions + reference to the guidelines provided earlier.
+   * Falls back to `text` when absent (skill keeps full re-injection).
+   */
+  laterStagesText?: string;
+  /** Snapshot-relative paths of the knowledge files that were used. */
+  files: string[];
+  /** Content hash of the injected knowledge (null for the bundled fallback). */
+  contentHash: string | null;
+  /** Retrieval/selection funnel metrics (null for the bundled fallback). */
+  metrics?: KnowledgeInjectionMetrics | null;
+}
+
+// ---------------------------------------------------------------------------
 // Inputs
 // ---------------------------------------------------------------------------
 
@@ -201,6 +254,11 @@ export interface ReviewInput {
     repository?: string;
     pullRequestNumber?: number;
   };
+  /**
+   * Review-type injection (§4.1): resolved by the pipeline before the engine
+   * runs; null/absent for `standard` (default flow unchanged).
+   */
+  promptInjection?: PromptInjection | null;
 }
 
 export type { ChangedFile };
@@ -212,7 +270,18 @@ export type { ChangedFile };
 /** Non-runtime engine failure (bad configuration, empty workspace, protocol misuse by tests). */
 export class ReviewEngineError extends Error {
   constructor(
-    public readonly code: "not_configured" | "empty_diff",
+    public readonly code:
+      | "not_configured"
+      | "empty_diff"
+      // Review-type injection failures (§4.1): skill/handbook content
+      // missing or unavailable — the review fails fast instead of silently
+      // running without the methodology text.
+      | "skill_playbook_unavailable"
+      | "handbook_unconfigured"
+      | "handbook_unavailable"
+      // Per-review knowledge snapshot reproducibility (§4): the persisted
+      // snapshot can no longer be materialized from the cache.
+      | "knowledge_snapshot_unavailable",
     message: string,
   ) {
     super(message);

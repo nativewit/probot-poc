@@ -27,6 +27,8 @@ export type ReviewJobPayload = {
   headSha: string;
   baseSha?: string | null;
   reviewMode: string;
+  /** Which review methodology runs (§4.1): standard | skill | handbook. */
+  reviewType: string;
   trigger: string;
   configurationHash?: string | null;
 };

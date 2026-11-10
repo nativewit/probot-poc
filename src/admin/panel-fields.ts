@@ -150,6 +150,19 @@ export const PANEL_FIELDS: Record<PanelSection, readonly PanelField[]> = {
     { path: "review.reporting.publishApproval", label: "Publish approvals", type: "boolean" },
     { path: "review.conventions.detectAutomatically", label: "Detect conventions automatically", type: "boolean" },
     { path: "review.conventions.customInstructions", label: "Custom instructions", type: "textarea" },
+    // Review types (§4.1): standard (default), skill (playbook) and handbook
+    // (retrieved standards). publish is the decision-7 GitHub gate.
+    { path: "review.types.standard.enabled", label: "Review type: standard enabled", type: "boolean" },
+    { path: "review.types.standard.publish", label: "Review type: standard publish to GitHub", type: "boolean" },
+    { path: "review.types.skill.enabled", label: "Review type: skill enabled", type: "boolean" },
+    { path: "review.types.skill.publish", label: "Review type: skill publish to GitHub", type: "boolean" },
+    { path: "review.types.skill.playbookPath", label: "Skill playbook path", type: "text" },
+    { path: "review.types.handbook.enabled", label: "Review type: handbook enabled", type: "boolean" },
+    { path: "review.types.handbook.publish", label: "Review type: handbook publish to GitHub", type: "boolean" },
+    { path: "review.types.handbook.repository", label: "Handbook repository (owner/repo)", type: "text" },
+    { path: "review.types.handbook.branch", label: "Handbook branch", type: "text" },
+    { path: "review.types.handbook.path", label: "Handbook subpath (dir or file)", type: "text" },
+    { path: "review.types.handbook.maxChars", label: "Handbook excerpt max chars", type: "number" },
   ],
   execution: [
     {
@@ -209,6 +222,12 @@ export const PANEL_FIELDS: Record<PanelSection, readonly PanelField[]> = {
       help: "Allowed: opened, synchronize, ready_for_review, issue_comment",
     },
     { path: "github.manualCommand", label: "Manual command", type: "text" },
+    {
+      path: "github.defaultReviewType",
+      label: "Default review type",
+      type: "enum",
+      options: ["standard", "skill", "handbook"],
+    },
     { path: "github.draftPullRequests.enabled", label: "Review draft pull requests", type: "boolean" },
     { path: "github.permissions.readContents", label: "Permission: read contents", type: "boolean" },
     { path: "github.permissions.readPullRequests", label: "Permission: read pull requests", type: "boolean" },

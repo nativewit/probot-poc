@@ -8,6 +8,7 @@ import { checkRedis, disconnectRedis, getRedis, waitRedisReady } from "./lib/red
 import { closeReviewQueue } from "./ingestion/queue.js";
 import { recoverOutbox } from "./ingestion/outbox.js";
 import { loadIngestionConfig } from "./ingestion/orchestrator.js";
+import { ensureKnowledgeSources, setKnowledgeSnapshot } from "./knowledge/index.js";
 import {
   createDefaultTokenProvider,
   startReviewWorker,
@@ -62,6 +63,36 @@ async function main(): Promise<void> {
   );
 
   const { config } = loadIngestionConfig();
+
+  // -------------------------------------------------------------------------
+  // Boot-time knowledge source initialization (§5.3): the code-review skill
+  // playbook and the engineering handbook are fetched ONCE per worker boot
+  // into the persistent knowledge cache — never per review. Bounded by a
+  // per-source fetch deadline; a total failure never crashes the worker
+  // (skill falls back to the bundled copy, handbook reviews fail fast, and
+  // standard reviews are unaffected).
+  // -------------------------------------------------------------------------
+  try {
+    const knowledgeCacheDir =
+      config.knowledge.cacheDir.trim() ||
+      process.env.KNOWLEDGE_CACHE_DIR?.trim() ||
+      path.join(process.env.WORKSPACE_ROOT_DIR ?? path.join(process.cwd(), "workspaces"), "knowledge");
+    const knowledgeSnapshot = await ensureKnowledgeSources(config, logger, { cacheDir: knowledgeCacheDir });
+    setKnowledgeSnapshot(knowledgeSnapshot);
+    logger.info(
+      {
+        skill: { status: knowledgeSnapshot.skill.status, ref: knowledgeSnapshot.skill.ref },
+        handbook: { status: knowledgeSnapshot.handbook.status, ref: knowledgeSnapshot.handbook.ref },
+        cacheDir: knowledgeSnapshot.cacheDir,
+      },
+      "Knowledge sources initialized",
+    );
+  } catch (error) {
+    logger.warn(
+      { err: error instanceof Error ? error.message : String(error) },
+      "Knowledge source initialization failed; the worker starts anyway (skill/handbook reviews will fail fast)",
+    );
+  }
 
   // Ticket 04: review workspace retrieval. The worker consumes the
   // "review-jobs" queue with the configured concurrency and runs the

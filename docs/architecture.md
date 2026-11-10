@@ -277,7 +277,76 @@ Manual command recommendation:
 
 `/review`
 
+The command accepts an optional **review type** argument (§4.1 review types):
+
+| Command | Review type |
+| --- | --- |
+| `/review` | `github.defaultReviewType` (default: `standard`) |
+| `/review type:skill` / `/review skill` | `skill` |
+| `/review type:handbook` / `/review handbook` | `handbook` |
+| `/review type:standard` / `/review standard` | `standard` |
+
+Unknown or disabled types post a short help comment and are NOT ingested.
+Manual commands always force a fresh review: the per-type attempt counter is
+incremented (first manual run of a type is attempt 1), so all types can
+review the same head SHA independently while duplicates within a type are
+still deduplicated.
+
 The command should be restricted to authorized organization members or configured repository collaborators.
+
+### Review types (§4.1)
+
+Three on-demand review methodologies run through the SAME adaptive engine and
+strategy (`review.mode` is independent of the type):
+
+- `standard` — the default engine and instructions.
+- `skill` — injects a code-review playbook (methodology + checklists) from
+  the review's own knowledge snapshot (bundled fallback:
+  `review.types.skill.playbookPath`) into the review prompt. A missing
+  playbook fails the review (`SKILL_PLAYBOOK_UNAVAILABLE`).
+- `handbook` — the trusted retrieval layer ranks the review's own cached
+  handbook files against the PR's detected technologies and changed paths
+  (technology category match > keyword overlap; `general/` eligible but
+  deprioritized) and selects content under a token budget
+  (`knowledge.handbook.maxTokens`, ≈4 chars/token; `maxChars` is a
+  byte-level backstop). Deterministic, deduplicated, whole-file-preferring.
+  An unconfigured handbook fails the review (`HANDBOOK_UNCONFIGURED`).
+
+Instruction profiles (trusted, application-controlled text in
+`src/review-engine/prompts/`):
+
+| mode     | profile                                                     |
+|----------|-------------------------------------------------------------|
+| standard | common security/scope rules (default flow, unchanged)        |
+| skill    | common + skill-mode instructions + playbook (untrusted data) |
+| handbook | common + handbook-mode instructions + retrieved guidelines (untrusted data) |
+
+Handbook reviews inject the guidelines block ONCE in the analysis stage;
+the investigation/reporting stages reuse it by reference (profile
+instructions + a digest of the provided files) instead of re-injecting the
+full text. Note: each engine stage runs as its own `opencode run` process
+without shared context, so the later-stage reference also carries the
+provided-files digest; full-text re-injection is avoided for token budget.
+
+Retrieval is Option A (application-side): the agent has NO handbook tools
+or permissions — deny-by-default agent permissions are unchanged — it only
+receives injected text. Per-review metrics (estimated injected tokens,
+documents retrieved, candidates → relevant → selected funnel, truncation
+flag) are persisted on `Review.knowledgeSnapshot.metrics` and exposed
+additively as `knowledgeMetrics` by the comparison endpoint.
+
+Publishing gate (decision 7): only types with
+`review.types.<type>.publish = true` post to GitHub (default: `standard`
+only). Other types run, persist findings and complete normally — the skip is
+recorded on the review (`publishSkipped`) and logged, and no GitHub comment
+is created.
+
+Admin API: `POST /api/admin/reviews/trigger` ingests a review of a given
+type; `GET /api/admin/reviews/compare?repository=owner/repo&pr=123` returns
+per-type rows (state, attempt, duration, severity counts, per-type unique
+findings, token usage, publishSkipped, additive per-source knowledgeSnapshot
+{ref, contentHash} and knowledgeMetrics {injectedTokens, documentsRetrieved,
+candidates, relevant, selected, truncated}) for one pull request.
 
 ## 4.2 Review workflow
 
@@ -340,6 +409,44 @@ Recommended default:
 7. Reject any result that no longer matches the current SHA.
 
 This behavior must be configurable.
+
+## 4.5 Knowledge sources (boot-time initialization)
+
+The code-review skill playbook (`vercel-labs/open-agents`, `.agents/skills/code-review`)
+and the engineering handbook (`nativewit/engineering-handbook`) are fetched ONCE per
+worker boot into a persistent cache — never per review (no GitHub API calls during a
+review).
+
+- Configuration: the `knowledge` section of `review.json` (`cacheDir`, `skill.{repo,
+  ref, skillDir, bundledFallback, maxBytes, maxTokens}`, `handbook.{repo, ref, path,
+  maxBytes, maxTokens, maxChars}`). Prod MUST pin refs via env overrides `KNOWLEDGE_SKILL_REF` /
+  `KNOWLEDGE_HANDBOOK_REF` (full commit SHAs); a branch-name ref is resolved to its
+  current commit SHA at boot so the cache is still SHA-keyed.
+- Cache layout: `<cacheDir>/skill/<sha>/…` and `<cacheDir>/handbook/<sha>/…`, each
+  with a `manifest.json` `{ ref, fetchedAt, contentHash (sha256), files[{path, sha256,
+  bytes}], status }`. A validated cached copy (manifest + per-file hashes match) is
+  reused with no network. Writes are atomic (temp dir + rename); `bundled/` holds the
+  shipped skill fallback (`config/skills/code-review.md`).
+- Fetch policy: ~30s deadline per source (covers bounded retries), size budgets
+  (`maxBytes`), extension allowlist (`.md/.txt`, skill also `.json/.yaml`), path
+  traversal rejection (no absolute paths, `..`, or symlinks) and stripping of
+  config-like manifests (`opencode.json`, `*.schema.json`, …).
+- Failure semantics: the worker never crashes. The skill degrades to the bundled
+  copy (`status "bundled"`); the handbook becomes `status "unavailable"` and handbook
+  reviews fail fast (`HANDBOOK_UNAVAILABLE` / `HANDBOOK_UNCONFIGURED`). Standard
+  reviews are unaffected.
+
+Per-review reproducibility: at pipeline start the review's knowledge files are copied
+into its own workspace (`<workspacePath>/knowledge/<source>/…`) and the snapshot
+identity `{ ref, contentHash, files[{path, sha256}] }` is persisted on the
+(`Review.knowledgeSnapshot`) and injection reads only the review's own copies, so a
+worker restart refreshing the cache cannot change an in-flight review. Recovery
+honors the persisted snapshot: if the boot cache no longer reproduces it (same ref
+AND content hash), the review fails with `KNOWLEDGE_SNAPSHOT_UNAVAILABLE` instead of
+silently re-reviewing against different knowledge. The comparison endpoint
+(`/api/admin/reviews/compare`) reports each review's per-source `ref` + `contentHash`
+plus the additive `knowledgeMetrics` (injectedTokens, documentsRetrieved,
+candidates/relevant/selected funnel, truncated).
 
 ---
 

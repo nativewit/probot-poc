@@ -76,6 +76,7 @@ function buildPayloadFromRows(review: Review, job: ReviewJob, repositoryFullName
     headSha: review.headSha,
     baseSha: review.baseSha,
     reviewMode: review.reviewMode,
+    reviewType: review.reviewType,
     trigger: review.trigger,
     configurationHash: review.configurationHash,
   };

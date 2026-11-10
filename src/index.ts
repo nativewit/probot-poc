@@ -1,6 +1,7 @@
 import { Probot } from "probot";
 import { handleIssuesOpened } from "./controllers/issue.controller.js";
 import { registerPullRequestHandlers } from "./handlers/pull-request.js";
+import { registerIssueCommentHandlers } from "./handlers/issue-comment.js";
 import { registerInstallationHandlers } from "./handlers/installation.js";
 
 export default (app: Probot) => {
@@ -17,6 +18,7 @@ export default (app: Probot) => {
   // enqueue it through the transactional outbox — the webhook handler never
   // runs the review itself.
   registerPullRequestHandlers(app);
+  registerIssueCommentHandlers(app);
   registerInstallationHandlers(app);
 
   // For more information on building apps:

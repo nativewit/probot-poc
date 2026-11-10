@@ -14,7 +14,8 @@ export type AuditAction =
   | "config.update_rejected"
   | "config.reload"
   | "config.rollback"
-  | "config.rollback_failed";
+  | "config.rollback_failed"
+  | "review.trigger";
 
 export interface AuditEntry {
   actor: string;

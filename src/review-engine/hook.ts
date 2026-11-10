@@ -20,7 +20,7 @@ import { transitionReviewState } from "../ingestion/review-state.js";
 import type { ReviewJobPayload } from "../ingestion/queue.js";
 import type { WorkspaceResult } from "../workspace/workspace.js";
 import { runReview } from "./engine.js";
-import type { RunReviewOutput } from "./types.js";
+import type { PromptInjection, RunReviewOutput } from "./types.js";
 import { recordProviderCall, recordReviewFindings } from "../observability/metrics.js";
 import { endSpan, reviewSpanAttributes, startSpan } from "../observability/tracing.js";
 
@@ -37,6 +37,11 @@ export interface ReviewEngineHookDeps {
 export type ReviewEngineHook = (ctx: {
   payload: ReviewJobPayload;
   workspace: WorkspaceResult;
+  /**
+   * Review-type injection (§4.1), resolved by the pipeline before the
+   * engine runs; omitted/null for standard reviews.
+   */
+  promptInjection?: PromptInjection | null;
 }) => Promise<RunReviewOutput>;
 
 /**
@@ -71,6 +76,7 @@ export function createReviewEngineHook(deps: ReviewEngineHookDeps): ReviewEngine
         {
           reviewId,
           workspace,
+          promptInjection: ctx.promptInjection ?? null,
           correlation: {
             repository: ctx.payload.repositoryFullName,
             pullRequestNumber: ctx.payload.pullRequestNumber,

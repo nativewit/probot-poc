@@ -171,7 +171,7 @@ function makeHandler(env: Env, configPath?: string) {
     logger: {
       info: (obj, msg) => logs.push({ level: "info", msg: `${msg}:${JSON.stringify(obj ?? "")}` }),
       warn: (_obj, msg) => logs.push({ level: "warn", msg }),
-      error: (_obj, msg) => logs.push({ level: "error", msg }),
+      error: (obj, msg) => logs.push({ level: "error", msg: `${msg}:${JSON.stringify(obj ?? "")}` }),
     },
     configPath,
   });
@@ -209,11 +209,12 @@ function authedHeaders(session: { cookie: string; csrfToken: string }, extra: Re
 
 let configDir: string;
 let handler: ReturnType<typeof makeHandler>["handler"];
+let logs: ReturnType<typeof makeHandler>["logs"];
 
 beforeEach(async () => {
   await prisma.auditLog.deleteMany();
   configDir = makeConfigDir();
-  ({ handler } = makeHandler(ADMIN_ENV, path.join(configDir, "review.json")));
+  ({ handler, logs } = makeHandler(ADMIN_ENV, path.join(configDir, "review.json")));
   githubUsers = undefined;
   tokenExchangeShouldFail = false;
   setGithubFetch(githubMock);
@@ -586,5 +587,244 @@ describe("admin api (ticket 10)", () => {
     expect(authorizeAdmin(allowlist, { login: "v" }, { role: "admin", state: "active" }).allowed).toBe(false);
     const multiRole: Env = loadEnv({ ...ADMIN_ENV, ADMIN_ORG_ADMIN_ROLES: "admin, billing-manager" });
     expect(authorizeAdmin(multiRole, base, { role: "member", state: "active" }).allowed).toBe(false);
+  });
+
+  test("review trigger endpoint ingests a review of the requested type", async () => {
+    githubUsers = { login: "octoadmin", membership: { role: "admin", state: "active" } };
+    const login1 = await login(handler);
+    const session = csrfCookiePair(login1);
+
+    // Clean leftovers from earlier failed runs (FK-safe order).
+    await prisma.outboxEvent.deleteMany();
+    await prisma.reviewStateTransition.deleteMany();
+    await prisma.reviewJob.deleteMany();
+    await prisma.review.deleteMany({ where: { OR: [{ pullRequestNumber: 21 }, { pullRequest: { repository: { fullName: "octo-org/trigger-test" } } }] } });
+    await prisma.pullRequest.deleteMany({ where: { repository: { fullName: "octo-org/trigger-test" } } });
+    await prisma.repository.deleteMany({ where: { fullName: "octo-org/trigger-test" } });
+    await prisma.installation.deleteMany({ where: { githubInstallationId: 820001n } });
+
+    const installation = await prisma.installation.create({
+      data: { githubInstallationId: 820001n, organization: "octo-org" },
+    });
+    const repository = await prisma.repository.create({
+      data: { githubRepositoryId: 820002n, installationId: installation.id, fullName: "octo-org/trigger-test" },
+    });
+    const pullRequest = await prisma.pullRequest.create({
+      data: { repositoryId: repository.id, githubPrNumber: 21, headSha: "dddd1111dddd1111dddd1111dddd1111dddd1111" },
+    });
+
+    try {
+      const triggered = await callAdmin(handler, "POST", "/api/admin/reviews/trigger", {
+        headers: authedHeaders(session),
+        body: { repository: "octo-org/trigger-test", pullRequestNumber: 21, reviewType: "skill" },
+      });
+      expect(triggered.statusCode, triggered.body + " LOGS: " + JSON.stringify(logs)).toBe(202);
+      const body = JSON.parse(triggered.body) as { outcome: string; reviewType: string; reviewId: string };
+      expect(body.outcome).toBe("created");
+      expect(body.reviewType).toBe("skill");
+
+      const review = await prisma.review.findUniqueOrThrow({ where: { id: body.reviewId } });
+      expect(review.reviewType).toBe("skill");
+      expect(review.pullRequestId).toBe(pullRequest.id);
+      expect(review.trigger).toBe("manual");
+
+      // Unknown repository → 404.
+      const missing = await callAdmin(handler, "POST", "/api/admin/reviews/trigger", {
+        headers: authedHeaders(session),
+        body: { repository: "octo-org/missing", pullRequestNumber: 1 },
+      });
+      expect(missing.statusCode).toBe(404);
+
+      // Invalid body → 400.
+      const invalid = await callAdmin(handler, "POST", "/api/admin/reviews/trigger", {
+        headers: authedHeaders(session),
+        body: { repository: "not-a-slug", pullRequestNumber: 1 },
+      });
+      expect(invalid.statusCode).toBe(400);
+    } finally {
+      await prisma.outboxEvent.deleteMany({ where: { reviewJob: { review: { pullRequestId: pullRequest.id } } } });
+      await prisma.reviewJob.deleteMany({ where: { review: { pullRequestId: pullRequest.id } } });
+      await prisma.reviewStateTransition.deleteMany({ where: { review: { pullRequestId: pullRequest.id } } });
+      await prisma.review.deleteMany({ where: { pullRequestId: pullRequest.id } });
+      await prisma.pullRequest.delete({ where: { id: pullRequest.id } });
+      await prisma.repository.delete({ where: { id: repository.id } });
+      await prisma.installation.delete({ where: { id: installation.id } });
+    }
+  });
+
+  test("compare endpoint returns per-type rows with findings and unique counts", async () => {
+    githubUsers = { login: "octoadmin", membership: { role: "admin", state: "active" } };
+    const login1 = await login(handler);
+    const session = csrfCookiePair(login1);
+
+    const installation = await prisma.installation.create({
+      data: { githubInstallationId: 830001n, organization: "octo-org" },
+    });
+    const repository = await prisma.repository.create({
+      data: { githubRepositoryId: 830002n, installationId: installation.id, fullName: "octo-org/compare-test" },
+    });
+    const pullRequest = await prisma.pullRequest.create({
+      data: { repositoryId: repository.id, githubPrNumber: 33, headSha: "eeee1111eeee1111eeee1111eeee1111eeee1111" },
+    });
+
+    const makeReview = (reviewType: "standard" | "skill") =>
+      prisma.review.create({
+        data: {
+          pullRequestId: pullRequest.id,
+          githubInstallationId: 830001n,
+          githubRepositoryId: 830002n,
+          pullRequestNumber: 33,
+          headSha: "eeee1111eeee1111eeee1111eeee1111eeee1111",
+          state: "completed",
+          trigger: "manual",
+          reviewType,
+          attempt: 1,
+          startedAt: new Date("2026-01-01T00:00:00Z"),
+          completedAt: new Date("2026-01-01T00:05:00Z"),
+          inputTokens: 1000,
+          outputTokens: 500,
+          publishSkipped: reviewType === "skill",
+          // Additive metrics (§16.1) for the skill row.
+          ...(reviewType === "skill"
+            ? {
+                knowledgeSnapshot: {
+                  skill: { ref: "a".repeat(40), status: "fresh", contentHash: "sha-skill", files: [] },
+                  metrics: {
+                    source: "skill",
+                    injectedTokens: 1200,
+                    documentsRetrieved: 1,
+                    candidates: 1,
+                    relevant: 1,
+                    selected: 1,
+                    truncated: false,
+                  },
+                },
+              }
+            : {}),
+        },
+      });
+
+    const standard = await makeReview("standard");
+    const skill = await makeReview("skill");
+    // Shared fingerprint found by BOTH types; one unique per type.
+    const sharedFp = "fp-shared";
+    await prisma.finding.create({
+      data: {
+        reviewId: standard.id,
+        repositoryId: repository.id,
+        fingerprint: sharedFp,
+        category: "functional",
+        severity: "high",
+        confidence: 0.9,
+        title: "shared",
+        filePath: "a.ts",
+        lineNumber: 1,
+        description: "d",
+        evidence: [],
+        verified: true,
+      },
+    });
+    await prisma.finding.create({
+      data: {
+        reviewId: skill.id,
+        repositoryId: repository.id,
+        fingerprint: sharedFp,
+        category: "functional",
+        severity: "high",
+        confidence: 0.9,
+        title: "shared",
+        filePath: "a.ts",
+        lineNumber: 1,
+        description: "d",
+        evidence: [],
+        verified: true,
+      },
+    });
+    await prisma.finding.create({
+      data: {
+        reviewId: skill.id,
+        repositoryId: repository.id,
+        fingerprint: "fp-skill-only",
+        category: "security",
+        severity: "critical",
+        confidence: 0.95,
+        title: "skill only",
+        filePath: "b.ts",
+        lineNumber: 2,
+        description: "d",
+        evidence: [],
+        verified: true,
+      },
+    });
+
+    try {
+      const result = await callAdmin(
+        handler,
+        "GET",
+        "/api/admin/reviews/compare?repository=octo-org/compare-test&pr=33",
+        { headers: { cookie: session.cookie } },
+      );
+      expect(result.statusCode).toBe(200);
+      const body = JSON.parse(result.body) as {
+        reviews: Array<{
+          id: string;
+          reviewType: string;
+          state: string;
+          attempt: number;
+          durationMs: number | null;
+          severityCounts: Record<string, number>;
+          uniqueFindings: number;
+          publishSkipped: boolean;
+          inputTokens: number | null;
+          knowledgeMetrics: {
+            source: string;
+            injectedTokens: number;
+            documentsRetrieved: number;
+            candidates: number;
+            relevant: number;
+            selected: number;
+            truncated: boolean;
+          } | null;
+        }>;
+      };
+      expect(body.reviews).toHaveLength(2);
+      const standardRow = body.reviews.find((r) => r.reviewType === "standard")!;
+      const skillRow = body.reviews.find((r) => r.reviewType === "skill")!;
+      expect(standardRow.state).toBe("completed");
+      expect(standardRow.attempt).toBe(1);
+      expect(standardRow.durationMs).toBe(5 * 60 * 1000);
+      expect(standardRow.severityCounts.high).toBe(1);
+      expect(standardRow.uniqueFindings).toBe(0);
+      expect(standardRow.publishSkipped).toBe(false);
+      expect(standardRow.inputTokens).toBe(1000);
+      expect(standardRow.knowledgeMetrics).toBeNull();
+      // Additive per-row injection metrics (§16.1).
+      expect(skillRow.knowledgeMetrics).toMatchObject({
+        source: "skill",
+        injectedTokens: 1200,
+        documentsRetrieved: 1,
+        candidates: 1,
+        relevant: 1,
+        selected: 1,
+        truncated: false,
+      });
+      expect(skillRow.severityCounts).toEqual({ high: 1, critical: 1 });
+      expect(skillRow.uniqueFindings).toBe(1);
+      expect(skillRow.publishSkipped).toBe(true);
+
+      // Missing query parameters → 400; unknown repository → 404.
+      const badQuery = await callAdmin(handler, "GET", "/api/admin/reviews/compare", { headers: { cookie: session.cookie } });
+      expect(badQuery.statusCode).toBe(400);
+      const unknown = await callAdmin(handler, "GET", "/api/admin/reviews/compare?repository=octo-org/nope&pr=1", {
+        headers: { cookie: session.cookie },
+      });
+      expect(unknown.statusCode).toBe(404);
+    } finally {
+      await prisma.finding.deleteMany({ where: { reviewId: { in: [standard.id, skill.id] } } });
+      await prisma.review.deleteMany({ where: { id: { in: [standard.id, skill.id] } } });
+      await prisma.pullRequest.delete({ where: { id: pullRequest.id } });
+      await prisma.repository.delete({ where: { id: repository.id } });
+      await prisma.installation.delete({ where: { id: installation.id } });
+    }
   });
 });

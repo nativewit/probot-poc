@@ -1,19 +1,25 @@
 {
   "$schema": "./schemas/review-config-v1.schema.json",
   "schemaVersion": 1,
-
   "application": {
     "name": "ai-pr-reviewer",
     "environment": "development",
     "timezone": "UTC"
   },
-
   "github": {
     "organization": "YOUR_ORGANIZATION",
     "installationScope": "organization",
-    "events": ["opened", "synchronize", "ready_for_review"],
+    "events": [
+      "opened",
+      "synchronize",
+      "ready_for_review",
+      "issue_comment"
+    ],
     "manualCommand": "/review",
-    "draftPullRequests": { "enabled": false },
+    "defaultReviewType": "standard",
+    "draftPullRequests": {
+      "enabled": false
+    },
     "permissions": {
       "readContents": true,
       "readPullRequests": true,
@@ -22,11 +28,17 @@
       "writeReviewComments": true
     }
   },
-
   "review": {
     "enabled": true,
-    "triggers": { "automatic": true, "manual": true },
-    "strategy": { "mode": "adaptive", "maxStages": 4, "verifyFindings": true },
+    "triggers": {
+      "automatic": true,
+      "manual": true
+    },
+    "strategy": {
+      "mode": "adaptive",
+      "maxStages": 4,
+      "verifyFindings": true
+    },
     "categories": {
       "functional": true,
       "regression": true,
@@ -39,8 +51,17 @@
       "maintainability": true,
       "testing": true
     },
-    "severity": ["critical", "high", "medium", "low", "informational"],
-    "confidence": { "minimumInline": 0.85, "minimumVerified": 0.8 },
+    "severity": [
+      "critical",
+      "high",
+      "medium",
+      "low",
+      "informational"
+    ],
+    "confidence": {
+      "minimumInline": 0.85,
+      "minimumVerified": 0.8
+    },
     "findings": {
       "deduplication": true,
       "trackAcrossCommits": true,
@@ -53,11 +74,36 @@
       "publishCleanReview": true,
       "publishApproval": false
     },
-    "conventions": { "detectAutomatically": true, "customInstructions": "" }
+    "conventions": {
+      "detectAutomatically": true,
+      "customInstructions": ""
+    },
+    "types": {
+      "standard": {
+        "enabled": true,
+        "publish": true
+      },
+      "skill": {
+        "enabled": true,
+        "publish": false,
+        "playbookPath": "config/skills/code-review.md"
+      },
+      "handbook": {
+        "enabled": true,
+        "publish": false,
+        "repository": "",
+        "branch": "main",
+        "path": "",
+        "maxChars": 20000
+      }
+    }
   },
-
   "agent": {
-    "runtime": { "type": "opencode-cli", "sessionStrategy": "per-review", "timeoutMs": 900000 },
+    "runtime": {
+      "type": "opencode-cli",
+      "sessionStrategy": "per-review",
+      "timeoutMs": 900000
+    },
     "context": {
       "adaptive": true,
       "maxFiles": 100,
@@ -66,11 +112,16 @@
       "maxOutputTokens": 8192
     },
     "tools": {
-      "enabled": ["read_file", "search_code", "list_files", "inspect_symbols", "get_diff"],
+      "enabled": [
+        "read_file",
+        "search_code",
+        "list_files",
+        "inspect_symbols",
+        "get_diff"
+      ],
       "permissionPolicy": "allowlist"
     }
   },
-
   "provider": {
     "type": "openai-compatible",
     "baseURL": "${MODEL_BASE_URL}",
@@ -81,11 +132,14 @@
     "timeoutMs": 120000,
     "failurePolicy": "fail-immediately"
   },
-
   "execution": {
     "mode": "static-analysis",
     "commands": {
-      "allowlist": ["git", "grep", "find"],
+      "allowlist": [
+        "git",
+        "grep",
+        "find"
+      ],
       "allowTests": false,
       "allowBuilds": false,
       "allowPackageScripts": false
@@ -103,28 +157,56 @@
       "executionTimeoutMs": 900000
     }
   },
-
   "repository": {
-    "clone": { "strategy": "shallow", "depth": 1 },
-    "workspace": { "retentionHours": 0, "cleanupAfterReview": true }
+    "clone": {
+      "strategy": "shallow",
+      "depth": 1
+    },
+    "workspace": {
+      "retentionHours": 0,
+      "cleanupAfterReview": true
+    }
   },
-
+  "knowledge": {
+    "cacheDir": "",
+    "fetchTimeoutMs": 30000,
+    "skill": {
+      "repo": "vercel-labs/open-agents",
+      "ref": "cf865e94de7729751c747171785b6ce57e7b178c",
+      "skillDir": ".agents/skills/code-review",
+      "bundledFallback": "config/skills/code-review.md",
+      "maxBytes": 200000,
+      "maxTokens": 1500
+    },
+    "handbook": {
+      "repo": "nativewit/engineering-handbook",
+      "ref": "main",
+      "path": "",
+      "maxBytes": 2000000,
+      "maxChars": 20000,
+      "maxTokens": 3000
+    }
+  },
   "queue": {
     "concurrency": 1,
     "newCommitPolicy": "supersede",
     "retry": {
-      "infrastructure": { "enabled": true, "maxAttempts": 3, "backoff": "exponential" },
-      "providerUnavailable": { "enabled": false }
+      "infrastructure": {
+        "enabled": true,
+        "maxAttempts": 3,
+        "backoff": "exponential"
+      },
+      "providerUnavailable": {
+        "enabled": false
+      }
     }
   },
-
   "persistence": {
     "reviewHistoryRetentionDays": 365,
     "findingRetentionDays": 365,
     "auditRetentionDays": 365,
     "artifactRetentionDays": 30
   },
-
   "configuration": {
     "reloadStrategy": "manual",
     "repositoryOverrides": {
@@ -136,14 +218,23 @@
         "review.strategy"
       ]
     },
-    "validation": { "strict": true, "dryRun": true },
+    "validation": {
+      "strict": true,
+      "dryRun": true
+    },
     "rollbackEnabled": true
   },
-
   "observability": {
-    "logs": { "level": "info", "format": "json" },
-    "metrics": { "enabled": true },
-    "tracing": { "enabled": true },
+    "logs": {
+      "level": "info",
+      "format": "json"
+    },
+    "metrics": {
+      "enabled": true
+    },
+    "tracing": {
+      "enabled": true
+    },
     "langfuse": {
       "enabled": true,
       "plugin": "@langfuse/opencode-observability-plugin@0.7.0"
@@ -155,7 +246,6 @@
       "resourceLimitExceeded": true
     }
   },
-
   "evaluation": {
     "enabled": true,
     "benchmarkSuite": "default",

@@ -121,6 +121,18 @@ enum ReviewTrigger {
   @@map("review_trigger")
 }
 
+// Review type (ARCHITECTURE.md §4.1): which review methodology runs for a
+// PR/head SHA. reviewMode (adaptive|fixed strategy) is independent: every
+// type runs through the same engine with the same strategy; skill injects a
+// playbook, handbook injects retrieved standards.
+enum ReviewType {
+  standard
+  skill
+  handbook
+
+  @@map("review_type")
+}
+
 model Review {
   id                  String       @id @default(cuid())
   pullRequestId       String       @map("pull_request_id")
@@ -132,6 +144,13 @@ model Review {
   state               ReviewState  @default(queued)
   trigger             ReviewTrigger
   reviewMode          String       @default("standard") @map("review_mode")
+  // Which review methodology runs (§4.1). Default `standard` keeps existing
+  // rows and existing tests (reviewMode "full" etc.) working unchanged.
+  reviewType          ReviewType   @default(standard) @map("review_type")
+  // Re-review discriminator (§12.3): 0 for automatic reviews; forced manual
+  // re-reviews of the same commit increment the attempt so a review can be
+  // re-triggered (e.g. `/review` comment) without violating identity.
+  attempt             Int          @default(0)
   // Immutable configuration snapshot identity (§11.5).
   configurationHash   String?      @map("configuration_hash")
   schemaVersion       Int?         @map("schema_version")
@@ -143,6 +162,18 @@ model Review {
   completedAt         DateTime?    @map("completed_at")
   errorCode           String?      @map("error_code")
   errorMessage        String?      @map("error_message")
+  // Set when the publishing gate (decision 7) skipped GitHub publication for
+  // this review's type — the review still completed and its findings are
+  // persisted, only the GitHub write did not happen.
+  publishSkipped      Boolean      @default(false) @map("publish_skipped")
+  // Aggregate token usage of the engine run (§16.1, comparison endpoint).
+  inputTokens         Int?         @map("input_tokens")
+  outputTokens        Int?         @map("output_tokens")
+  // Per-review knowledge snapshot identity (§4 reproducibility): the ref,
+  // content hash and per-file sha256s of the knowledge content this review
+  // STARTED with. Immutable after first materialization; recovery paths
+  // verify against it instead of mutating it.
+  knowledgeSnapshot   Json?        @map("knowledge_snapshot")
   supersededByReviewId String?     @map("superseded_by_review_id")
   supersededAt        DateTime?    @map("superseded_at")
   createdAt           DateTime     @default(now()) @map("created_at")
@@ -157,8 +188,11 @@ model Review {
   findings           Finding[]
   comments           ReviewComment[]
 
-  // Idempotency (§12.3): the same commit of the same PR is one review ever.
-  @@unique([pullRequestId, headSha, reviewMode])
+  // Idempotency (§12.3): one review per (PR, head SHA, mode, TYPE) unless a
+  // forced re-review raises the attempt counter. reviewType is part of the
+  // identity so standard/skill/handbook can review the same commit
+  // independently while dedupe still collapses duplicates within a type.
+  @@unique([pullRequestId, headSha, reviewMode, reviewType, attempt])
   @@index([pullRequestId, state])
   @@index([githubInstallationId, githubRepositoryId, pullRequestNumber])
   @@map("reviews")

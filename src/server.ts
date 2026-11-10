@@ -120,6 +120,8 @@ const manualReviewBodySchema = z.object({
     .string()
     .regex(/^[0-9a-f]{7,40}$/i, "must be a git SHA (7-40 hex chars)")
     .optional(),
+  /** Review type (§4.1); omitted → github.defaultReviewType (standard). */
+  reviewType: z.enum(["standard", "skill", "handbook"]).optional(),
 });
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {

@@ -1,8 +1,9 @@
 import { Probot, ProbotOctokit } from "probot";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import myProbotApp from "../src/index.js";
 import { getPrisma, disconnectPrisma } from "../src/lib/prisma.js";
 import { checkRedis, disconnectRedis } from "../src/lib/redis.js";
@@ -30,6 +31,22 @@ process.env.REDIS_URL ??= "redis://localhost:6379";
 // The ingestion path loads config/review.json, whose provider.baseURL
 // references ${MODEL_BASE_URL}; provide a value so validation succeeds.
 process.env.MODEL_BASE_URL ??= "http://localhost:8000";
+
+/**
+ * Test seam for the review-type tests: when set, every loadReviewConfig call
+ * (webhook handlers + orchestrator) reads this path instead of
+ * config/review.json. Only used by the "disabled review type" test; unset
+ * the rest of the time so all other tests exercise the real configuration.
+ */
+const configPathHolder = vi.hoisted(() => ({ path: undefined as string | undefined }));
+vi.mock("../src/config/review-loader.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/config/review-loader.js")>();
+  return {
+    ...actual,
+    loadReviewConfig: ((path: string, ...rest: unknown[]) =>
+      actual.loadReviewConfig(configPathHolder.path ?? path, ...(rest as []))) as typeof actual.loadReviewConfig,
+  };
+});
 
 const prisma = getPrisma();
 
@@ -70,6 +87,39 @@ function pullRequestPayload(action: "opened" | "synchronize" | "ready_for_review
   };
 }
 
+function commentPayload(body: string, overrides: Record<string, unknown> = {}) {
+  const issueOverrides = (overrides.issue ?? {}) as Record<string, unknown>;
+  const commentOverrides = (overrides.comment ?? {}) as Record<string, unknown>;
+  const { issue: _i, comment: _c, ...topLevelOverrides } = overrides;
+  void _i;
+  void _c;
+  return {
+    action: "created",
+    installation: { id: INSTALLATION_ID },
+    repository: {
+      id: REPOSITORY_ID,
+      full_name: REPO_FULL_NAME,
+      name: "widget",
+      default_branch: "main",
+      owner: { login: "octo-org" },
+    },
+    ...topLevelOverrides,
+    issue: {
+      number: 42,
+      state: "open",
+      draft: false,
+      user: { type: "User", login: "octocat" },
+      pull_request: { url: `https://api.github.com/repos/${REPO_FULL_NAME}/pulls/42` },
+      ...issueOverrides,
+    },
+    comment: {
+      body,
+      user: { type: "User", login: "octocat" },
+      ...commentOverrides,
+    },
+  };
+}
+
 function installationPayload(installationId: number, accountLogin: string, repos: Array<{ id: number; full_name: string }>) {
   return {
     action: "created",
@@ -91,6 +141,11 @@ async function cleanDatabase(): Promise<void> {
   await prisma.reviewStateTransition.deleteMany();
   await prisma.reviewJob.deleteMany();
   await prisma.reviewComment.deleteMany();
+  await prisma.reviewWorkspace.deleteMany();
+  await prisma.findingStatusTransition.deleteMany();
+  await prisma.finding.deleteMany();
+  await prisma.commandExecutionAudit.deleteMany();
+  await prisma.evaluationRun.deleteMany();
   await prisma.review.deleteMany();
   await prisma.pullRequest.deleteMany();
   await prisma.repository.deleteMany();
@@ -190,7 +245,7 @@ describe("review ingestion", () => {
     expect(review!.schemaVersion).toBe(1);
 
     const job = await prisma.reviewJob.findFirst({ where: { reviewId: review!.id } });
-    expect(job?.jobKey).toBe(`${INSTALLATION_ID}:${REPOSITORY_ID}:42:aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111:adaptive`);
+    expect(job?.jobKey).toBe(`${INSTALLATION_ID}:${REPOSITORY_ID}:42:aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111:adaptive:standard`);
     // Redis is up in the integration environment: the outbox publishes immediately.
     expect(job?.status).toBe("enqueued");
 
@@ -313,6 +368,167 @@ describe("review ingestion", () => {
     expect(jobs).toHaveLength(0);
   });
 
+  test("/review comment re-triggers a review even though the commit was already reviewed", async () => {
+    // Automatic review of the commit first (trigger opened).
+    await receiveDelivery(probot, "pull_request", "opened", pullRequestPayload("opened"), "delivery-cmd-open-1");
+    expect(await prisma.review.count()).toBe(1);
+
+    // /review on the same head SHA: forced re-review must be created anyway.
+    await receiveDelivery(
+      probot,
+      "issue_comment",
+      "created",
+      commentPayload("/review"),
+      "delivery-cmd-1",
+    );
+
+    const reviews = await prisma.review.findMany({ orderBy: { createdAt: "asc" } });
+    expect(reviews).toHaveLength(2);
+    const manual = reviews[1];
+    expect(manual.trigger).toBe("manual");
+    expect(manual.state).toBe("queued");
+    expect(manual.attempt).toBe(1);
+    expect(manual.headSha).toBe("aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111");
+
+    const manualJob = await prisma.reviewJob.findFirstOrThrow({ where: { reviewId: manual.id } });
+    expect(manualJob.status).toBe("enqueued");
+    expect(manual.reviewType).toBe("standard");
+    expect(manualJob.jobKey).toBe(`${INSTALLATION_ID}:${REPOSITORY_ID}:42:aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111:adaptive:standard:a1`);
+  });
+
+  test("repeated /review comments create one fresh review per command", async () => {
+    await receiveDelivery(probot, "pull_request", "opened", pullRequestPayload("opened"), "delivery-cmd-open-2");
+    await receiveDelivery(probot, "issue_comment", "created", commentPayload("/review"), "delivery-cmd-2");
+    await receiveDelivery(probot, "issue_comment", "created", commentPayload("/review standard"), "delivery-cmd-3");
+
+    const reviews = await prisma.review.findMany({ orderBy: { createdAt: "asc" } });
+    expect(reviews).toHaveLength(3);
+    expect(reviews.map((r) => r.trigger)).toEqual(["opened", "manual", "manual"]);
+    expect(reviews.map((r) => r.reviewType)).toEqual(["standard", "standard", "standard"]);
+    expect(reviews.map((r) => r.attempt)).toEqual([0, 1, 2]);
+    const jobs = await prisma.reviewJob.findMany();
+    expect(new Set(jobs.map((j) => j.jobKey)).size).toBe(3);
+  });
+
+  test("/review type:skill ingests a skill review with its own attempt counter", async () => {
+    await receiveDelivery(probot, "pull_request", "opened", pullRequestPayload("opened"), "delivery-skill-open-1");
+    await receiveDelivery(probot, "issue_comment", "created", commentPayload("/review type:skill"), "delivery-skill-1");
+
+    const reviews = await prisma.review.findMany({ orderBy: { createdAt: "asc" } });
+    expect(reviews).toHaveLength(2);
+    const skill = reviews[1]!;
+    expect(skill.reviewType).toBe("skill");
+    expect(skill.trigger).toBe("manual");
+    expect(skill.attempt).toBe(1);
+    const job = await prisma.reviewJob.findFirstOrThrow({ where: { reviewId: skill.id } });
+    expect(job.jobKey).toBe(`${INSTALLATION_ID}:${REPOSITORY_ID}:42:aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111:adaptive:skill:a1`);
+
+    // Repeating the skill command increments the skill attempt counter.
+    await receiveDelivery(probot, "issue_comment", "created", commentPayload("/review skill"), "delivery-skill-2");
+    const skillReviews = await prisma.review.findMany({ where: { reviewType: "skill" }, orderBy: { createdAt: "asc" } });
+    expect(skillReviews.map((r) => r.attempt)).toEqual([1, 2]);
+  });
+
+  test("the same head SHA can have standard and skill reviews concurrently (distinct identity)", async () => {
+    await receiveDelivery(probot, "pull_request", "opened", pullRequestPayload("opened"), "delivery-types-open-1");
+    // A bare /review creates ANOTHER standard review (attempt 1, forced).
+    await receiveDelivery(probot, "issue_comment", "created", commentPayload("/review"), "delivery-types-1");
+    // A skill review of the SAME head SHA is an independent identity.
+    await receiveDelivery(probot, "issue_comment", "created", commentPayload("/review type:skill"), "delivery-types-2");
+
+    const reviews = await prisma.review.findMany();
+    expect(reviews).toHaveLength(3);
+    // §4.4: the forced standard re-review supersedes the in-flight standard
+    // review of the same PR — but the skill review of the same commit is an
+    // independent identity and keeps running.
+    const standardReviews = reviews.filter((r) => r.reviewType === "standard");
+    expect(standardReviews.map((r) => r.state).sort()).toEqual(["queued", "superseded"]);
+    const skillReview = reviews.find((r) => r.reviewType === "skill");
+    expect(skillReview?.state).toBe("queued");
+
+    const jobs = await prisma.reviewJob.findMany();
+    expect(new Set(jobs.map((j) => j.jobKey)).size).toBe(3);
+    // §4.4: the forced standard re-review supersedes only the standard
+    // in-flight review; the skill job keeps running.
+    expect(jobs.filter((j) => j.status === "superseded")).toHaveLength(1);
+    expect(jobs.filter((j) => j.status === "enqueued")).toHaveLength(2);
+    // No review of one type bleeds into another type's identity.
+    const byType = reviews.reduce<Record<string, number>>((acc, r) => {
+      acc[r.reviewType] = (acc[r.reviewType] ?? 0) + 1;
+      return acc;
+    }, {});
+    expect(byType).toEqual({ standard: 2, skill: 1 });
+  });
+  test("unknown review type posts help and does not ingest", async () => {
+    await receiveDelivery(probot, "pull_request", "opened", pullRequestPayload("opened"), "delivery-unknown-open-1");
+    await receiveDelivery(probot, "issue_comment", "created", commentPayload("/review type:wat"), "delivery-unknown-1");
+    await receiveDelivery(probot, "issue_comment", "created", commentPayload("/review wat"), "delivery-unknown-2");
+
+    const reviews = await prisma.review.findMany();
+    expect(reviews).toHaveLength(1); // only the automatic opened review
+    expect(reviews[0]!.reviewType).toBe("standard");
+  });
+
+  test("disabled review type posts help and does not ingest", async () => {
+    // Serve a temporary configuration with the skill type disabled for the
+    // duration of this test (see the loadReviewConfig mock at the top).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "review-types-test-"));
+    const disabled = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), "config/review.json"), "utf8")) as Record<string, unknown>;
+    (disabled as { review: Record<string, unknown> }).review = {
+      ...((disabled as { review: Record<string, unknown> }).review as Record<string, unknown>),
+      types: {
+        ...((((disabled as { review: Record<string, unknown> }).review as Record<string, unknown>).types ?? {}) as Record<string, unknown>),
+        skill: { enabled: false, publish: false, playbookPath: "config/skills/code-review.md" },
+      },
+    };
+    const configPath = path.join(dir, "review.json");
+    fs.writeFileSync(configPath, JSON.stringify(disabled));
+    configPathHolder.path = configPath;
+    try {
+      await receiveDelivery(probot, "pull_request", "opened", pullRequestPayload("opened"), "delivery-disabled-open-1");
+      await receiveDelivery(probot, "issue_comment", "created", commentPayload("/review skill"), "delivery-disabled-1");
+
+      const reviews = await prisma.review.findMany();
+      expect(reviews).toHaveLength(1);
+      expect(reviews[0]!.reviewType).toBe("standard");
+    } finally {
+      configPathHolder.path = undefined;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("non-command comments, bot comments and closed PRs are ignored", async () => {
+    await receiveDelivery(probot, "pull_request", "opened", pullRequestPayload("opened"), "delivery-cmd-open-3");
+    const before = await prisma.review.count();
+
+    await receiveDelivery(probot, "issue_comment", "created", commentPayload("Looks good to me!"), "delivery-cmd-4");
+    await receiveDelivery(probot, "issue_comment", "created", commentPayload("/reviewre"), "delivery-cmd-5");
+    await receiveDelivery(
+      probot,
+      "issue_comment",
+      "created",
+      commentPayload("/review", { comment: { user: { type: "Bot", login: "ai-pr-reviewer[bot]" } } }),
+      "delivery-cmd-6",
+    );
+    await receiveDelivery(
+      probot,
+      "issue_comment",
+      "created",
+      commentPayload("/review", { issue: { state: "closed" } }),
+      "delivery-cmd-7",
+    );
+    // Plain issues (no pull_request marker) are ignored too.
+    await receiveDelivery(
+      probot,
+      "issue_comment",
+      "created",
+      commentPayload("/review", { issue: { number: 99, state: "open", pull_request: undefined } }),
+      "delivery-cmd-8",
+    );
+
+    expect(await prisma.review.count()).toBe(before);
+  });
+
   test("installation.created registers installation + repositories; installation.deleted disables them", async () => {
     await receiveDelivery(
       probot,
@@ -358,7 +574,15 @@ describe("review ingestion", () => {
 
     const review = await prisma.review.findUniqueOrThrow({ where: { id: result.reviewId! } });
     expect(review.trigger).toBe("manual");
+    expect(review.reviewType).toBe("standard");
     expect(review.pullRequestId).toBe(pullRequest.id);
+
+    // Manual ingestion accepts a review type (§4.1): same PR/SHA, independent
+    // identity.
+    const skillResult = await ingestManualReview({ repository: "octo-org/gamma", pullRequestNumber: 7, reviewType: "skill" });
+    expect(skillResult.outcome).toBe("created");
+    const skillReview = await prisma.review.findUniqueOrThrow({ where: { id: skillResult.reviewId! } });
+    expect(skillReview.reviewType).toBe("skill");
 
     const status = await getReviewStatus(result.reviewId!);
     expect(status?.review.state).toBe("queued");

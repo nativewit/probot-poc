@@ -24,9 +24,11 @@ import { publishOutboxEvent } from "./outbox.js";
  * Idempotency (§12.3):
  * - Webhook delivery: unique WebhookDelivery.deliveryId collapses duplicate
  *   webhook deliveries (GitHub retries with the same X-GitHub-Delivery id).
- * - Review identity: unique (pullRequestId, headSha, reviewMode) means the
- *   same commit of the same PR is one review ever.
- * - Job identity: unique jobKey `installation:repository:pr:sha:mode`.
+ * - Review identity: unique (pullRequestId, headSha, reviewMode, reviewType,
+ *   attempt) means one review per commit per type; forced manual re-reviews
+ *   (`/review` command) increment `attempt` instead of deduping.
+ * - Job identity: unique jobKey
+ *   `installation:repository:pr:sha:mode:type[:a<attempt>]`.
  * - Outdated commits: default queue.newCommitPolicy "supersede" (§4.4) — a
  *   newer push supersedes in-flight reviews for the same PR.
  */
@@ -34,6 +36,10 @@ import { publishOutboxEvent } from "./outbox.js";
 const logger: pino.Logger = createLogger(loadEnv());
 
 export type IngestTrigger = "opened" | "synchronized" | "ready_for_review" | "manual";
+
+/** Review types (ARCHITECTURE.md §4.1). Mirrors the Prisma ReviewType enum. */
+export const REVIEW_TYPES = ["standard", "skill", "handbook"] as const;
+export type ReviewTypeValue = (typeof REVIEW_TYPES)[number];
 
 export type IngestReviewRequestInput = {
   trigger: IngestTrigger;
@@ -50,6 +56,21 @@ export type IngestReviewRequestInput = {
   draft: boolean;
   /** GitHub delivery id (X-GitHub-Delivery) for webhook idempotency. */
   deliveryId?: string;
+  /**
+   * Which review methodology runs (§4.1): standard | skill | handbook.
+   * Independent of `review.mode` (the adaptive/fixed strategy): every type
+   * runs the same engine; skill/handbook inject extra instructions.
+   */
+  reviewType?: ReviewTypeValue;
+  /**
+   * Force a brand-new review even when a review already exists for the same
+   * (PR, head SHA, review mode, review type) — used by the manual `/review`
+   * command (§12.3): the attempt counter is incremented so identity stays
+   * unique.
+   */
+  force?: boolean;
+  /** Webhook-delivery event label recorded for idempotency (§12.1). */
+  deliveryEvent?: string;
 };
 
 export type IngestOutcome =
@@ -65,6 +86,8 @@ export type IngestReviewRequestResult = {
   reviewId?: string;
   jobId?: string;
   state?: ReviewState;
+  /** Attempt counter of the created review (forced re-reviews). */
+  attempt?: number;
 };
 
 export class ManualIngestionError extends Error {
@@ -90,8 +113,16 @@ export function buildJobKey(parts: {
   pullRequestNumber: number;
   headSha: string;
   reviewMode: string;
+  reviewType: string;
 }): string {
-  return [parts.installationId, parts.repositoryId, parts.pullRequestNumber, parts.headSha, parts.reviewMode].join(":");
+  return [
+    parts.installationId,
+    parts.repositoryId,
+    parts.pullRequestNumber,
+    parts.headSha,
+    parts.reviewMode,
+    parts.reviewType,
+  ].join(":");
 }
 
 /**
@@ -118,8 +149,15 @@ export async function ingestReviewRequest(input: IngestReviewRequestInput): Prom
   }
   const config = snapshot.configuration;
   const reviewMode = config.review.strategy.mode;
+  const reviewType: ReviewTypeValue = input.reviewType ?? "standard";
   const reviewEnabled = config.review.enabled;
   const supersede = config.queue.newCommitPolicy === "supersede";
+
+  // Unknown review types are rejected explicitly — never silently coerced to
+  // standard, which would corrupt type comparison.
+  if (!REVIEW_TYPES.includes(reviewType)) {
+    return { outcome: "skipped", reason: `unknown review type '${reviewType}'` };
+  }
 
   // Draft pull requests are skipped unless explicitly enabled (§4.1).
   if (input.draft && !config.github.draftPullRequests.enabled) {
@@ -175,27 +213,57 @@ export async function ingestReviewRequest(input: IngestReviewRequestInput): Prom
       },
     });
 
-    // 2. Review identity (§12.3): one review per (PR, head SHA, mode).
-    const existingReview = await tx.review.findUnique({
-      where: { pullRequestId_headSha_reviewMode: { pullRequestId: pullRequest.id, headSha: input.headSha, reviewMode } },
-      include: { job: true },
-    });
+    // 2. Review identity (§12.3): one review per (PR, head SHA, mode), unless
+    //    the request is forced (manual `/review` re-review), which raises the
+    //    attempt counter instead of collapsing into the existing review.
+      const existingReview = input.force
+      ? null
+      : await tx.review.findUnique({
+          where: {
+            pullRequestId_headSha_reviewMode_reviewType_attempt: {
+              pullRequestId: pullRequest.id,
+              headSha: input.headSha,
+              reviewMode,
+              reviewType,
+              attempt: 0,
+            },
+          },
+          include: { job: true },
+        });
     if (existingReview) {
-      return {
-        duplicate: true as const,
-        reviewId: existingReview.id,
-        jobId: existingReview.job?.id,
-        state: existingReview.state,
-      };
+    return {
+      duplicate: true as const,
+      reviewId: existingReview.id,
+      jobId: existingReview.job?.id,
+      state: existingReview.state,
+      attempt: existingReview.attempt,
+    };
     }
 
-    // 3. Supersede outdated in-flight reviews of this PR (§4.4).
+    // 3. Supersede outdated in-flight reviews of this PR (§4.4). Superseding
+    //    is scoped to the SAME review type: standard/skill/handbook reviews
+    //    of the same PR are independent identities (§4.1) and must never
+    //    cancel each other.
     const inFlight = supersede
       ? await tx.review.findMany({
-          where: { pullRequestId: pullRequest.id, state: { notIn: [...TERMINAL_REVIEW_STATES] } },
+          where: { pullRequestId: pullRequest.id, reviewType, state: { notIn: [...TERMINAL_REVIEW_STATES] } },
           include: { job: true },
         })
       : [];
+
+    // Forced re-reviews increment the attempt so (PR, head SHA, mode, type,
+    // attempt) stays unique; automatic reviews always use attempt 0 and the
+    // attempt counter is per type. A forced review is always attempt >= 1
+    // (e.g. the first `/review type:skill` of a PR is attempt 1), so manual
+    // runs never collide with the automatic attempt-0 identity.
+    let attempt = 0;
+    if (input.force) {
+      const aggregate = await tx.review.aggregate({
+        where: { pullRequestId: pullRequest.id, headSha: input.headSha, reviewMode, reviewType },
+        _max: { attempt: true },
+      });
+      attempt = Math.max(aggregate._max.attempt ?? 0, 0) + 1;
+    }
 
     const review = await tx.review.create({
       data: {
@@ -208,6 +276,8 @@ export async function ingestReviewRequest(input: IngestReviewRequestInput): Prom
         state: "queued",
         trigger: input.trigger,
         reviewMode,
+        reviewType,
+        attempt,
         configurationHash: snapshot.hash,
         schemaVersion: snapshot.schemaVersion,
       },
@@ -216,13 +286,16 @@ export async function ingestReviewRequest(input: IngestReviewRequestInput): Prom
       data: { reviewId: review.id, fromState: null, toState: "queued" },
     });
 
-    const jobKey = buildJobKey({
+    const jobKeyBase = buildJobKey({
       installationId: String(installationId),
       repositoryId: String(repositoryId),
       pullRequestNumber: input.pullRequestNumber,
       headSha: input.headSha,
       reviewMode,
+      reviewType,
     });
+    // Attempt > 0 (forced re-review) gets a distinct durable job identity.
+    const jobKey = attempt > 0 ? `${jobKeyBase}:a${attempt}` : jobKeyBase;
     const job = await tx.reviewJob.create({
       data: { reviewId: review.id, status: "pending_outbox", jobKey },
     });
@@ -262,6 +335,7 @@ export async function ingestReviewRequest(input: IngestReviewRequestInput): Prom
           headSha: input.headSha,
           baseSha: input.baseSha ?? null,
           reviewMode,
+          reviewType,
           trigger: input.trigger,
           configurationHash: snapshot.hash,
           reviewEnabled,
@@ -269,14 +343,14 @@ export async function ingestReviewRequest(input: IngestReviewRequestInput): Prom
       },
     });
 
-    return { duplicate: false as const, reviewId: review.id, jobId: job.id, outboxEventId: outboxEvent.id, state: "queued" as const };
+    return { duplicate: false as const, reviewId: review.id, jobId: job.id, outboxEventId: outboxEvent.id, state: "queued" as const, attempt };
   });
 
   // Record the webhook delivery only once durable state is committed.
   if (input.deliveryId) {
     await prisma.webhookDelivery
       .create({
-        data: { deliveryId: input.deliveryId, event: `pull_request.${input.trigger}`, reviewJobId: result.jobId ?? null },
+        data: { deliveryId: input.deliveryId, event: input.deliveryEvent ?? `pull_request.${input.trigger}`, reviewJobId: result.jobId ?? null },
       })
       .catch(() => {
         // Concurrent duplicate delivery: the review identity check above
@@ -301,7 +375,7 @@ export async function ingestReviewRequest(input: IngestReviewRequestInput): Prom
     logger.info({ reviewId: result.reviewId }, "Review queued durably; enqueue deferred to outbox recovery");
   }
 
-  return { outcome: "created", reviewId: result.reviewId, jobId: result.jobId, state: result.state };
+  return { outcome: "created", reviewId: result.reviewId, jobId: result.jobId, state: result.state, attempt: result.attempt };
 }
 
 
@@ -315,6 +389,8 @@ export type ManualIngestionInput = {
   repository: string;
   pullRequestNumber: number;
   headSha?: string;
+  /** Which review methodology runs (§4.1); defaults to "standard". */
+  reviewType?: ReviewTypeValue;
 };
 
 export async function ingestManualReview(input: ManualIngestionInput): Promise<IngestReviewRequestResult> {
@@ -339,6 +415,7 @@ export async function ingestManualReview(input: ManualIngestionInput): Promise<I
 
   return ingestReviewRequest({
     trigger: "manual",
+    reviewType: input.reviewType ?? "standard",
     installationId: repository.installation.githubInstallationId.toString(),
     repositoryId: repository.githubRepositoryId.toString(),
     repositoryName: repository.fullName,
