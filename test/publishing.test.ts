@@ -6,6 +6,7 @@ import type pino from "pino";
 import { getPrisma, disconnectPrisma } from "../src/lib/prisma.js";
 import { reviewConfigSchema, type ReviewConfig } from "../src/config/review-schema.js";
 import type { Finding, FindingEvidence, ReviewResult } from "../src/review-engine/index.js";
+import type { ReviewRunMetadata } from "../src/review-engine/types.js";
 import type { ReviewJobPayload } from "../src/ingestion/queue.js";
 import type { WorkspaceResult } from "../src/workspace/workspace.js";
 import type { AgentRuntime } from "../src/agent/types.js";
@@ -394,7 +395,7 @@ function makeResult(output: Partial<ReviewResult> = {}): ReviewResult {
   };
 }
 
-function makeMeta() {
+function makeMeta(): ReviewRunMetadata {
   return {
     plan: {
       complexity: { score: 1, tier: "low" as const, factors: [] },
@@ -865,6 +866,111 @@ describe("finalizeReview pipeline (engine → persist → publish → terminal s
       "validating->publishing",
       "publishing->completed",
     ]);
+  });
+
+  test("logs one post-publication telemetry summary with per-stage token usage", async () => {
+    const seed = await seedReview("fp-telemetry");
+    await prisma.review.update({ where: { id: seed.reviewId }, data: { state: "validating" } });
+    const state = makeState(seed.headSha);
+    const info = vi.fn();
+    const deps = makeDeps(state, {
+      logger: { info, warn: () => {}, error: () => {}, debug: () => {} } as unknown as pino.Logger,
+    });
+    const meta = makeMeta();
+    meta.usage = {
+      modelCalls: [
+        {
+          stage: "initial-analysis",
+          inputTokens: 900,
+          outputTokens: 300,
+          reasoningTokens: 120,
+          durationMs: 1_000,
+        },
+        {
+          stage: "reporting-prep",
+          inputTokens: 400,
+          outputTokens: 200,
+          reasoningTokens: 30,
+          durationMs: 800,
+        },
+      ],
+      totalInputTokens: 1_300,
+      totalOutputTokens: 500,
+      durationMs: 1_800,
+    };
+
+    await finalizeReview(
+      deps,
+      { payload: makePayload(seed.reviewId, seed.headSha), workspace: makeWorkspace(seed.headSha) },
+      { result: makeResult(), meta },
+    );
+
+    const telemetry = info.mock.calls
+      .map(([record]) => record as Record<string, unknown>)
+      .find((record) => record?.event === "review_telemetry");
+    expect(telemetry).toBeDefined();
+    expect(telemetry).toMatchObject({
+      reviewId: seed.reviewId,
+      repository: REPO_FULL_NAME,
+      pullRequestNumber: PR_NUMBER,
+      outcome: "published",
+      modelCalls: 2,
+      inputTokens: 1_300,
+      outputTokens: 500,
+      reasoningTokens: 150,
+      totalTokens: 1_950,
+      usagePersisted: true,
+    });
+    expect(telemetry?.calls).toEqual([
+      { stage: "initial-analysis", input: 900, output: 300, reasoning: 120, durationMs: 1_000 },
+      { stage: "reporting-prep", input: 400, output: 200, reasoning: 30, durationMs: 800 },
+    ]);
+
+    // The same totals are persisted on the review row (§16.1).
+    const review = await prisma.review.findUniqueOrThrow({ where: { id: seed.reviewId } });
+    expect(review.inputTokens).toBe(1_300);
+    expect(review.outputTokens).toBe(500);
+  });
+
+  test("publication failure still logs telemetry and persists the tokens already spent", async () => {
+    const seed = await seedReview("fp-telemetry-failed");
+    await prisma.review.update({ where: { id: seed.reviewId }, data: { state: "validating" } });
+    const state = makeState(seed.headSha);
+    state.failCreateTimes = 999;
+    const info = vi.fn();
+    const deps = makeDeps(state, {
+      logger: { info, warn: () => {}, error: () => {}, debug: () => {} } as unknown as pino.Logger,
+    });
+    const meta = makeMeta();
+    meta.usage = {
+      modelCalls: [
+        { stage: "initial-analysis", inputTokens: 700, outputTokens: 100, durationMs: 500 },
+      ],
+      totalInputTokens: 700,
+      totalOutputTokens: 100,
+      durationMs: 500,
+    };
+
+    await finalizeReview(
+      deps,
+      { payload: makePayload(seed.reviewId, seed.headSha), workspace: makeWorkspace(seed.headSha) },
+      { result: makeResult(), meta },
+    );
+
+    const telemetry = info.mock.calls
+      .map(([record]) => record as Record<string, unknown>)
+      .find((record) => record?.event === "review_telemetry");
+    expect(telemetry).toMatchObject({
+      outcome: "publication_failed",
+      inputTokens: 700,
+      outputTokens: 100,
+      reasoningTokens: 0,
+      usagePersisted: true,
+    });
+    const review = await prisma.review.findUniqueOrThrow({ where: { id: seed.reviewId } });
+    expect(review.state).toBe("completed_with_warnings");
+    expect(review.inputTokens).toBe(700);
+    expect(review.outputTokens).toBe(100);
   });
 
   test("findings persistence failure → review failed with findings_persist_failed", async () => {

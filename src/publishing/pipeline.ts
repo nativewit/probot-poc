@@ -58,6 +58,106 @@ export type ReviewPipelineHook = (ctx: {
 }) => Promise<RunReviewOutput>;
 
 /**
+ * Best-effort aggregate token usage persistence (§16.1). Returns whether the
+ * write succeeded so the telemetry record can state it.
+ */
+async function persistReviewUsage(
+  prisma: PrismaClient,
+  reviewId: string,
+  output: RunReviewOutput,
+): Promise<boolean> {
+  return prisma.review
+    .update({
+      where: { id: reviewId },
+      data: {
+        inputTokens: output.meta.usage.totalInputTokens,
+        outputTokens: output.meta.usage.totalOutputTokens,
+      },
+    })
+    .then(() => true)
+    .catch(() => false);
+}
+
+/**
+ * One structured telemetry record per terminal review.
+ *
+ * The engine computes per-stage token usage, but the pre-publish engine log
+ * carried only totals and the pipeline's completion log carried only the
+ * outcome — so "what did this review cost and where did it go" needed several
+ * lines and still could not show the per-stage split or the inline/summary
+ * publication split. This record is the join key: reviewId plus the engine
+ * breakdown plus the publication result, emitted on success, skip and failure
+ * (tokens burned by a failed publish are still cost).
+ */
+function buildReviewTelemetry(input: {
+  config: ReviewConfig;
+  payload: ReviewJobPayload;
+  headSha: string;
+  reviewType: string;
+  output: RunReviewOutput;
+  outcome: string;
+  inlineCreated?: number;
+  summaryOnlyFindings?: number;
+  inlineDeduped?: number;
+  reconciled?: number;
+  usagePersisted?: boolean;
+  errorCode?: string;
+}): Record<string, unknown> {
+  const { config, payload, output } = input;
+  const calls = output.meta.usage.modelCalls.map((call) => ({
+    stage: call.stage,
+    input: call.inputTokens ?? 0,
+    output: call.outputTokens ?? 0,
+    reasoning: call.reasoningTokens ?? 0,
+    durationMs: call.durationMs,
+  }));
+  const reasoningTokens = calls.reduce((sum, call) => sum + call.reasoning, 0);
+  const inputTokens = output.meta.usage.totalInputTokens;
+  const outputTokens = output.meta.usage.totalOutputTokens;
+  const sdkEnabled = Boolean((config.agent as { sdk?: { enabled?: boolean } }).sdk?.enabled);
+  const findings = output.result.findings;
+  return {
+    event: "review_telemetry",
+    reviewId: payload.reviewId,
+    repository: payload.repositoryFullName,
+    pullRequestNumber: payload.pullRequestNumber,
+    headSha: input.headSha,
+    reviewType: input.reviewType,
+    outcome: input.outcome,
+    ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+    runtime: sdkEnabled ? "opencode-sdk" : config.agent.runtime.type,
+    provider: config.provider.type,
+    model: config.provider.model,
+    tier: output.meta.plan.tier,
+    complexityScore: output.meta.plan.complexity.score,
+    modelCalls: calls.length,
+    inputTokens,
+    outputTokens,
+    reasoningTokens,
+    totalTokens: inputTokens + outputTokens + reasoningTokens,
+    calls,
+    engineDurationMs: output.meta.usage.durationMs,
+    retrieval: {
+      requested: output.meta.retrieval.requested,
+      fulfilled: output.meta.retrieval.fulfilled,
+      rejected: output.meta.retrieval.rejected,
+      bytesDelivered: output.meta.retrieval.bytesDelivered,
+      violations: output.meta.retrieval.violations.length,
+    },
+    findings: {
+      total: findings.length,
+      verified: findings.filter((finding) => finding.verified).length,
+      uncertain: output.result.uncertainFindings.length,
+      inline: input.inlineCreated ?? 0,
+      summaryOnly: input.summaryOnlyFindings ?? 0,
+      inlineDeduped: input.inlineDeduped ?? 0,
+      reconciled: input.reconciled ?? 0,
+    },
+    ...(input.usagePersisted === undefined ? {} : { usagePersisted: input.usagePersisted }),
+  };
+}
+
+/**
  * Persist the engine's findings and publish the review, driving the state
  * machine from `validating` to a terminal state. Exported for direct testing;
  * `createReviewPipelineHook` composes this after the engine hook.
@@ -131,7 +231,18 @@ export async function finalizeReview(
     });
     await transitionReviewState(reviewId, "completed");
     endSpan(publishSpan);
-    logger.info({ reviewId, outcome: "publish_skipped" }, "Review pipeline completed (publication skipped by type gate)");
+    logger.info(
+      buildReviewTelemetry({
+        config: deps.config,
+        payload,
+        headSha: workspace.headSha,
+        reviewType: review.reviewType,
+        output,
+        outcome: "publish_skipped",
+        usagePersisted: await persistReviewUsage(prisma, reviewId, output),
+      }),
+      "Review telemetry summary",
+    );
     return;
   }
 
@@ -178,21 +289,26 @@ export async function finalizeReview(
     });
 
     // Persist aggregate token usage (§16.1 comparison endpoint).
-    await prisma.review
-      .update({
-        where: { id: reviewId },
-        data: {
-          inputTokens: output.meta.usage.totalInputTokens,
-          outputTokens: output.meta.usage.totalOutputTokens,
-        },
-      })
-      .catch(() => {
-        /* best-effort metrics */
-      });
+    const usagePersisted = await persistReviewUsage(prisma, reviewId, output);
 
     await transitionReviewState(reviewId, "completed");
     endSpan(publishSpan);
-    logger.info({ reviewId, outcome: publish.outcome }, "Review pipeline completed");
+    logger.info(
+      buildReviewTelemetry({
+        config: deps.config,
+        payload,
+        headSha: workspace.headSha,
+        reviewType: review.reviewType,
+        output,
+        outcome: publish.outcome,
+        inlineCreated: publish.inlineCreated,
+        summaryOnlyFindings: publish.summaryOnlyFindings,
+        inlineDeduped: publish.inlineDeduped,
+        reconciled: publish.reconciled,
+        usagePersisted,
+      }),
+      "Review telemetry summary",
+    );
   } catch (error) {
     if (error instanceof StaleHeadError) {
       // §4.3/§4.4: reject the result, publish nothing.
@@ -204,10 +320,36 @@ export async function finalizeReview(
       }).catch(() => {
         /* already terminal */
       });
+      logger.info(
+        buildReviewTelemetry({
+          config: deps.config,
+          payload,
+          headSha: workspace.headSha,
+          reviewType: review.reviewType,
+          output,
+          outcome: "stale_commit",
+          errorCode: "stale_commit",
+          usagePersisted: await persistReviewUsage(prisma, reviewId, output),
+        }),
+        "Review telemetry summary",
+      );
       throw error;
     }
     endSpan(publishSpan, error);
     const message = redactCredentials(error instanceof Error ? error.message : String(error));
+    const usagePersisted = await persistReviewUsage(prisma, reviewId, output);
+    logger.info(
+      buildReviewTelemetry({
+        config: deps.config,
+        payload,
+        headSha: workspace.headSha,
+        reviewType: review.reviewType,
+        output,
+        outcome: "publication_failed",
+        usagePersisted,
+      }),
+      "Review telemetry summary",
+    );
     logger.error({ reviewId, err: message }, "GitHub publication failed");
     await recordPublicationFailure(prisma, reviewId);
     // The review data is intact and retained; only the GitHub write failed.

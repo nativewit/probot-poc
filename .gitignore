@@ -24,3 +24,6 @@ deploy/secrets/*
 # The .gitkeep keeps the mount-source directory present in a fresh checkout.
 deploy/dozzle/*
 !deploy/dozzle/.gitkeep
+
+
+experiments
