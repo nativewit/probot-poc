@@ -101,8 +101,12 @@ interface OpenCodeEvent {
 
 /** How long to wait after SIGTERM before escalating to SIGKILL. */
 const KILL_GRACE_MS = 2_000;
-/** Max characters kept from any runtime detail attached to errors. */
-const MAX_DETAIL_LENGTH = 500;
+/**
+ * Max characters kept from any runtime detail attached to errors. A crashing
+ * CLI can emit 10KB+ of stderr; 500 chars only captured startup noise, which
+ * made production crashes undiagnosable.
+ */
+const MAX_DETAIL_LENGTH = 4_000;
 /** Upper bound on captured child output (both streams), bytes. */
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 /** Max characters logged for a single sanitized child-output line. */
@@ -702,7 +706,9 @@ export class OpenCodeAgentRuntime implements AgentRuntime {
             new AgentRuntimeError(
               "crash",
               signal ? `agent runtime killed by signal ${signal}` : `agent runtime exited with code ${code}`,
-              { sessionId, detail: truncate(scrub(stderr || stdout, this.config)) },
+              // The failure reason is usually at the END of stderr (startup
+              // banners come first), so keep the tail of the output.
+              { sessionId, detail: truncateTail(scrub(stderr || stdout, this.config)) },
             ),
           );
           return;
@@ -946,6 +952,11 @@ function scrub(text: string, config: AgentRuntimeConfigSource): string {
 
 function truncate(text: string, max = MAX_DETAIL_LENGTH): string {
   return text.length <= max ? text : `${text.slice(0, max)}…[truncated]`;
+}
+
+/** Like `truncate`, but keeps the end of `text` (where CLI errors appear). */
+function truncateTail(text: string, max = MAX_DETAIL_LENGTH): string {
+  return text.length <= max ? text : `…[truncated]${text.slice(text.length - max)}`;
 }
 
 /**

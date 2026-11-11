@@ -27,6 +27,10 @@ import { getMetricsRegistry } from "../observability/metrics.js";
 import { endSpan, reviewSpanAttributes, startSpan } from "../observability/tracing.js";
 import { classifyFailure, retryPolicyFor, type RetryPolicyConfig } from "../observability/retry.js";
 import { DEFAULT_RETRY_POLICY_CONFIG } from "../observability/retry.js";
+import { AgentRuntimeError } from "../agent/types.js";
+
+/** Max characters of error detail attached to the structured failure log. */
+const MAX_LOGGED_ERROR_DETAIL_CHARS = 4_000;
 
 /**
  * Review worker job processor (ticket 04).
@@ -172,10 +176,19 @@ export async function processReviewJob(
     // it the worker only reports a generic message and the root cause is lost.
     const rawDetail = (error as { detail?: unknown } | null)?.detail;
     const errorDetail =
-      typeof rawDetail === "string" ? redactCredentials(rawDetail).slice(0, 500) : undefined;
-    const errorCode = (error as { code?: unknown } | null)?.code;
+      typeof rawDetail === "string"
+        ? redactCredentials(rawDetail).slice(0, MAX_LOGGED_ERROR_DETAIL_CHARS)
+        : undefined;
+    // Both retrieval errors (`clone_failed`, …) and agent runtime errors
+    // (`crash`, `timeout`, …) carry a normalized code. Dropping the agent code
+    // made every runtime crash classify as "unknown" (no retry, no class in
+    // metrics), so it must reach the classifier.
+    const errorCode =
+      error instanceof ReviewRetrievalError || error instanceof AgentRuntimeError
+        ? error.code
+        : undefined;
     const failureClass = classifyFailure({
-      errorCode: error instanceof ReviewRetrievalError ? error.code : null,
+      errorCode: errorCode ?? null,
       message,
     });
     const decision = retryPolicyFor(failureClass, deps.retryPolicy ?? DEFAULT_RETRY_POLICY_CONFIG);

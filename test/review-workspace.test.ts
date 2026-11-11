@@ -13,6 +13,7 @@ import { parseNameStatus, readWorkspaceFile, resolveWorkspacePath, PathEscapeErr
 import { redactCredentials, sanitizeGitUrl } from "../src/workspace/redact.js";
 import { processReviewJob, type ProcessReviewJobDeps } from "../src/workspace/processor.js";
 import type { InstallationTokenProvider } from "../src/workspace/credentials.js";
+import { AgentRuntimeError } from "../src/agent/types.js";
 
 /**
  * Ticket 04 integration tests: repository review workspace.
@@ -487,6 +488,41 @@ describe("worker processor", () => {
     // Workspace cleaned up after the review (cleanupAfterReview default true).
     expect(await prisma.reviewWorkspace.count({ where: { reviewId: chain.reviewId, status: "cleaned" } })).toBe(1);
     expect(fs.existsSync(root)).toBe(true); // root survives, workspaces don't
+  });
+
+  test("agent runtime crash is classified as agent_crash, not unknown", async () => {
+    const { service } = makeService();
+    const chain = await createReviewChain();
+    const errors: Array<Record<string, unknown>> = [];
+    const capturingLogger = {
+      ...silentLogger,
+      error: (obj: Record<string, unknown>) => errors.push(obj),
+    };
+    const outcome = await processReviewJob(chain.jobId, {
+      reviewId: chain.reviewId,
+      jobKey: "k",
+      githubInstallationId: INSTALLATION_ID.toString(),
+      githubRepositoryId: "12345",
+      repositoryFullName: REPO_FULL_NAME,
+      pullRequestNumber: PR_NUMBER,
+      headSha,
+      reviewMode: "standard",
+      trigger: "opened",
+    }, {
+      ...makeDeps(service, capturingLogger),
+      onWorkspacePrepared: async () => {
+        throw new AgentRuntimeError("crash", "agent runtime exited with code 1", {
+          detail: "provider rejected request: model not found",
+        });
+      },
+    });
+
+    expect(outcome).toBe("failed");
+    const failure = errors.find((entry) => entry.failure_class !== undefined);
+    expect(failure?.error_code).toBe("crash");
+    expect(failure?.failure_class).toBe("agent_crash");
+    expect(failure?.retry_decision).toMatchObject({ retry: true });
+    expect(failure?.err_detail).toContain("model not found");
   });
 
   test("job still marked pending_outbox is claimed and processed (outbox publish race)", async () => {

@@ -52,6 +52,19 @@ const NO_RETRY = (rationale: string): RetryDecision => ({
   rationale,
 });
 
+/**
+ * Exact `AgentRuntimeError.code` values (§8.4) mapped onto failure classes.
+ * Matched exactly so generic substrings (e.g. `provider_timeout` containing
+ * "timeout") keep their existing meaning below.
+ */
+const AGENT_ERROR_CODE_CLASS: Readonly<Record<string, FailureClass>> = {
+  crash: "agent_crash",
+  spawn: "agent_crash",
+  timeout: "resource_limit_exceeded",
+  provider_unavailable: "model_unavailable",
+  invalid_output: "invalid_model_output",
+};
+
 /** Patterns used to classify errors that arrive without an error code. */
 const MESSAGE_PATTERNS: ReadonlyArray<[RegExp, FailureClass]> = [
   [/bad ?credentials|401|unauthorized|forbidden|rate limit|secondary rate|403|502|503|504|ECONNRESET|ETIMEDOUT|ENOTFOUND/i, "github_api_transient"],
@@ -60,7 +73,7 @@ const MESSAGE_PATTERNS: ReadonlyArray<[RegExp, FailureClass]> = [
   [/clone|checkout|git (failed|error)|shallow/i, "clone_failure"],
   [/model|provider|openai|completion|llm|endpoint/i, "model_unavailable"],
   [/invalid (model )?output|schema|parse|validation/i, "invalid_model_output"],
-  [/agent (crashed|died)|non-zero exit|signal/i, "agent_crash"],
+  [/agent (crashed|died)|agent runtime (exited|crashed)|exited with code|non-zero exit|signal/i, "agent_crash"],
   [/resource limit|out of memory|disk quota|timeout.*exceeded|oom/i, "resource_limit_exceeded"],
   [/stale.*commit|head moved/i, "stale_commit"],
 ];
@@ -69,6 +82,9 @@ const MESSAGE_PATTERNS: ReadonlyArray<[RegExp, FailureClass]> = [
 export function classifyFailure(input: { errorCode?: string | null; message?: string | null }): FailureClass {
   const code = (input.errorCode ?? "").toLowerCase();
   const message = input.message ?? "";
+
+  const agentClass = AGENT_ERROR_CODE_CLASS[code];
+  if (agentClass) return agentClass;
 
   if (code.includes("stale_commit") || /head moved|stale.*commit/i.test(message)) return "stale_commit";
   if (code.includes("github") || code.includes("403") || code.includes("401") || code.includes("rate_limit")) {

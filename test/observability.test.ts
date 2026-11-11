@@ -374,11 +374,25 @@ describe("failure classification", () => {
     expect(classifyFailure({ errorCode: "resource_quota" })).toBe("resource_limit_exceeded");
   });
 
+  test("agent runtime error codes map to failure classes", () => {
+    // `AgentRuntimeError.code` values (§8.4) arrive verbatim from the runtime.
+    expect(classifyFailure({ errorCode: "crash" })).toBe("agent_crash");
+    expect(classifyFailure({ errorCode: "spawn" })).toBe("agent_crash");
+    expect(classifyFailure({ errorCode: "timeout" })).toBe("resource_limit_exceeded");
+    expect(classifyFailure({ errorCode: "provider_unavailable" })).toBe("model_unavailable");
+    expect(classifyFailure({ errorCode: "invalid_output" })).toBe("invalid_model_output");
+    // Exact matching must not steal composite codes like `provider_timeout`.
+    expect(classifyFailure({ errorCode: "provider_timeout" })).toBe("model_unavailable");
+    // Security/integrity failures stay unclassified (and therefore unretried).
+    expect(classifyFailure({ errorCode: "workspace_modified" })).toBe("unknown");
+  });
+
   test("unclassified errors fall back to message patterns", () => {
     expect(classifyFailure({ message: "connect ECONNREFUSED 127.0.0.1:6379" })).toBe("redis_unavailable");
     expect(classifyFailure({ message: "P1001 can't reach database server" })).toBe("postgres_unavailable");
     expect(classifyFailure({ message: "git clone failed: shallow fetch error" })).toBe("clone_failure");
     expect(classifyFailure({ message: "agent crashed with non-zero exit code" })).toBe("agent_crash");
+    expect(classifyFailure({ message: "agent runtime exited with code 1" })).toBe("agent_crash");
     expect(classifyFailure({ message: "request failed: 502 bad gateway" })).toBe("github_api_transient");
     expect(classifyFailure({ message: "head moved since review started" })).toBe("stale_commit");
     expect(classifyFailure({ message: "????" })).toBe("unknown");

@@ -540,6 +540,21 @@ describe("execute: failure normalization", () => {
     });
   });
 
+  it("crash: long stderr keeps the tail where the real error is", async () => {
+    const child = new FakeChild();
+    const { runtime } = makeRuntime(child);
+    const { session } = await startedSession(runtime);
+    const resultPromise = runtime.execute(session, { instruction: "x", output: "text" });
+    await vi.waitFor(() => expect(child.stdout.listenerCount("data")).toBeGreaterThan(0));
+    const noise = `${"startup banner ".repeat(2_000)}provider rejected request: model not found`;
+    child.stderr.emit("data", Buffer.from(noise));
+    child.close(1);
+    const err = await resultPromise.catch((e: unknown) => e as { code: string; detail: string });
+    expect(err.code).toBe("crash");
+    expect(err.detail).toContain("model not found");
+    expect(err.detail.length).toBeLessThanOrEqual(4_100);
+  });
+
   it("crash: spawn ENOENT is reported as a spawn error", async () => {
     const errorChild = Object.assign(new EventEmitter(), {
       stdout: new EventEmitter(),
