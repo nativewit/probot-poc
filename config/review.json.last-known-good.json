@@ -138,9 +138,9 @@
   },
   "provider": {
     "type": "openai-compatible",
-    "baseURL": "https://llm.nativewit.app/compat",
+    "baseURL": "${MODEL_BASE_URL}",
     "apiKeyEnv": "MODEL_API_KEY",
-    "model": "glm-4.7-flash",
+    "model": "${MODEL_NAME}",
     "temperature": 0.1,
     "maxOutputTokens": 8192,
     "timeoutMs": 120000,
