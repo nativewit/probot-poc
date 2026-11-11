@@ -103,7 +103,7 @@ async function main(): Promise<void> {
     for (const f of result.findings) {
       console.log(
         `  - [${f.severity}/${f.category}] ${f.title} @ ${f.file}:${f.line} ` +
-          `confidence=${f.confidence} verified=${f.verified}`,
+          `confidence=${Math.round(f.confidence * 100)}% verified=${f.verified}`,
       );
       console.log(`    ${truncate(f.description, 240)}`);
       for (const e of f.evidence) {
@@ -112,7 +112,7 @@ async function main(): Promise<void> {
     }
     console.log(`uncertain (${result.uncertainFindings.length}):`);
     for (const f of result.uncertainFindings) {
-      console.log(`  - ${f.title} @ ${f.file}:${f.line} confidence=${f.confidence}`);
+      console.log(`  - ${f.title} @ ${f.file}:${f.line} confidence=${Math.round(f.confidence * 100)}%`);
     }
     const sawCaller = result.findings.some((f) => f.file.endsWith("caller.ts"));
     console.log(sawCaller ? "RESULT: PASS — caller.ts bug surfaced via tool protocol" : "RESULT: caller.ts bug NOT surfaced");

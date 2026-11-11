@@ -67,7 +67,7 @@ export function buildReviewBody(input: FindingsBodyInput): string {
         : `\`${finding.filePath}:${finding.lineNumber}\``;
       parts.push(
         `- **${truncate(finding.title, 200)}** — ${SEVERITY_LABEL[finding.severity] ?? finding.severity}, ` +
-          `confidence \`${finding.confidence.toFixed(2)}\` · ${location}\n` +
+          `confidence \`${Math.round(finding.confidence * 100)}%\` · ${location}\n` +
           `  ${truncate(finding.description, 1_000)}`,
       );
     }
@@ -78,7 +78,7 @@ export function buildReviewBody(input: FindingsBodyInput): string {
     for (const finding of input.uncertain) {
       parts.push(
         `- **${truncate(finding.title, 200)}** — ${SEVERITY_LABEL[finding.severity] ?? finding.severity}, ` +
-          `confidence \`${finding.confidence.toFixed(2)}\` · \`${finding.filePath}:${finding.lineNumber}\`\n` +
+          `confidence \`${Math.round(finding.confidence * 100)}%\` · \`${finding.filePath}:${finding.lineNumber}\`\n` +
           `  ${truncate(finding.description, 1_000)}`,
       );
     }
@@ -100,7 +100,7 @@ export function buildInlineCommentBody(finding: StoredFinding): string {
     "",
     truncate(finding.description, 4_000),
     "",
-    `_Category: \`${finding.category}\` · Severity: ${SEVERITY_LABEL[finding.severity] ?? finding.severity} · Confidence: \`${finding.confidence.toFixed(2)}\`_`,
+    `_Category: \`${finding.category}\` · Severity: ${SEVERITY_LABEL[finding.severity] ?? finding.severity} · Confidence: \`${Math.round(finding.confidence * 100)}%\`_`,
   ].join("\n");
   const marked = `${fingerprintMarker(finding.fingerprint)}\n${body}`;
   return marked.length <= MAX_BODY_CHARS ? marked : `${marked.slice(0, MAX_BODY_CHARS - 1)}…`;
