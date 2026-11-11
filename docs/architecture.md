@@ -301,9 +301,9 @@ strategy (`review.mode` is independent of the type):
 
 - `standard` — the default engine and instructions.
 - `skill` — injects a code-review playbook (methodology + checklists) from
-  the review's own knowledge snapshot (bundled fallback:
-  `review.types.skill.playbookPath`) into the review prompt. A missing
-  playbook fails the review (`SKILL_PLAYBOOK_UNAVAILABLE`).
+  the review's own knowledge snapshot into the review prompt. The playbook
+  comes only from the fetched source (`knowledge.skill`); a missing or
+  unavailable playbook fails the review (`SKILL_PLAYBOOK_UNAVAILABLE`).
 - `handbook` — the trusted retrieval layer ranks the review's own cached
   handbook files against the PR's detected technologies and changed paths
   (technology category match > keyword overlap; `general/` eligible but
@@ -418,23 +418,22 @@ worker boot into a persistent cache — never per review (no GitHub API calls du
 review).
 
 - Configuration: the `knowledge` section of `review.json` (`cacheDir`, `skill.{repo,
-  ref, skillDir, bundledFallback, maxBytes, maxTokens}`, `handbook.{repo, ref, path,
+  ref, skillDir, maxBytes, maxTokens}`, `handbook.{repo, ref, path,
   maxBytes, maxTokens, maxChars}`). Prod MUST pin refs via env overrides `KNOWLEDGE_SKILL_REF` /
   `KNOWLEDGE_HANDBOOK_REF` (full commit SHAs); a branch-name ref is resolved to its
   current commit SHA at boot so the cache is still SHA-keyed.
 - Cache layout: `<cacheDir>/skill/<sha>/…` and `<cacheDir>/handbook/<sha>/…`, each
   with a `manifest.json` `{ ref, fetchedAt, contentHash (sha256), files[{path, sha256,
   bytes}], status }`. A validated cached copy (manifest + per-file hashes match) is
-  reused with no network. Writes are atomic (temp dir + rename); `bundled/` holds the
-  shipped skill fallback (`config/skills/code-review.md`).
+  reused with no network. Writes are atomic (temp dir + rename).
 - Fetch policy: ~30s deadline per source (covers bounded retries), size budgets
   (`maxBytes`), extension allowlist (`.md/.txt`, skill also `.json/.yaml`), path
   traversal rejection (no absolute paths, `..`, or symlinks) and stripping of
   config-like manifests (`opencode.json`, `*.schema.json`, …).
-- Failure semantics: the worker never crashes. The skill degrades to the bundled
-  copy (`status "bundled"`); the handbook becomes `status "unavailable"` and handbook
-  reviews fail fast (`HANDBOOK_UNAVAILABLE` / `HANDBOOK_UNCONFIGURED`). Standard
-  reviews are unaffected.
+- Failure semantics: the worker never crashes. There is no fallback content: a
+  failed source becomes `status "unavailable"` and the review types that need it fail
+  fast (`SKILL_PLAYBOOK_UNAVAILABLE` / `HANDBOOK_UNAVAILABLE` /
+  `HANDBOOK_UNCONFIGURED`). Standard reviews are unaffected.
 
 Per-review reproducibility: at pipeline start the review's knowledge files are copied
 into its own workspace (`<workspacePath>/knowledge/<source>/…`) and the snapshot

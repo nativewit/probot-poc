@@ -6,13 +6,13 @@
  *  - cache miss → fetch → manifest written + per-file hashes;
  *  - cache hit → the fetcher is never called;
  *  - ref change → refetch under the new ref;
- *  - invalid content (oversize, fetch failure) → rejected; skill falls back
- *    to bundled, handbook becomes unavailable;
+ *  - invalid content (oversize, fetch failure) → rejected; the source becomes
+ *    unavailable and its review type fails fast (no fallback content);
  *  - concurrent ensure calls resolve once;
  *  - per-review materialization: own workspace copy + persisted snapshot,
  *    injection reads only the copy, and unreproducible snapshots fail fast.
  */
-import { mkdirSync, mkdtempSync, readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
 import fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -54,7 +54,7 @@ function makeConfig(skillRef: string = SKILL_REF, handbookRef: string = "main"):
     github: { organization: "acme" },
     knowledge: {
       fetchTimeoutMs: 5000,
-      skill: { repo: "vercel-labs/open-agents", ref: skillRef, skillDir: "skills/code-review", bundledFallback: "config/skills/code-review.md", maxBytes: 200000 },
+      skill: { repo: "vercel-labs/open-agents", ref: skillRef, skillDir: "skills/code-review", maxBytes: 200000 },
       handbook: { repo: "nativewit/engineering-handbook", ref: handbookRef, path: "", maxBytes: 2000000, maxChars: 20000 },
     },
   });
@@ -105,10 +105,7 @@ const tempDirs: string[] = [];
 function makeCacheDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "knowledge-"));
   tempDirs.push(dir);
-  const cacheDir = join(dir, "cache");
-  mkdirSync(join(dir, "config", "skills"), { recursive: true });
-  writeFileSync(join(dir, "config", "skills", "code-review.md"), "# bundled fallback\n\nBundled playbook.", "utf8");
-  return cacheDir;
+  return join(dir, "cache");
 }
 
 beforeEach(() => {
@@ -129,7 +126,7 @@ describe("ensureKnowledgeSources", () => {
       [`${HANDBOOK_SHA}/docs/standards.md`]: "# Standards\n\nBe excellent.",
       [`${HANDBOOK_SHA}/package.json`]: "{}", // config-like manifest: stripped
     }, { main: HANDBOOK_SHA });
-    const snapshot = await ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher, root: join(cacheDir, "..") });
+    const snapshot = await ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher });
 
     expect(snapshot.skill.status).toBe("fresh");
     expect(snapshot.skill.ref).toBe(SKILL_REF);
@@ -148,12 +145,12 @@ describe("ensureKnowledgeSources", () => {
   test("cache hit → no network (fetcher not called)", async () => {
     const cacheDir = makeCacheDir();
     const first = makeFetcher({ [`${SKILL_REF}/skills/code-review/SKILL.md`]: "# skill", [`${HANDBOOK_SHA}/docs/standards.md`]: "# Standards" });
-    const snapshot1 = await ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher: first, root: join(cacheDir, "..") });
+    const snapshot1 = await ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher: first });
     expect(first.calls.length).toBeGreaterThan(0);
     expect(snapshot1.skill.ref).toBe(SKILL_REF);
 
     const second = makeFetcher({});
-    const snapshot2 = await ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher: second, root: join(cacheDir, "..") });
+    const snapshot2 = await ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher: second });
     expect(second.calls).toHaveLength(0);
     expect(snapshot2.skill.status).toBe("fresh");
     expect(snapshot2.skill.contentHash).toBe(snapshot1.skill.contentHash);
@@ -162,7 +159,7 @@ describe("ensureKnowledgeSources", () => {
   test("ref change → refetch under the new ref (and env override feeds the ref)", async () => {
     const cacheDir = makeCacheDir();
     const first = makeFetcher({ [`${SKILL_REF}/skills/code-review/SKILL.md`]: "# v1", [`${HANDBOOK_SHA}/docs/standards.md`]: "# Standards" });
-    await ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher: first, root: join(cacheDir, "..") });
+    await ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher: first });
 
     // Env override is part of the per-source spec.
     const specs = knowledgeSpecsFromConfig(makeConfig(), { KNOWLEDGE_SKILL_REF: SKILL_REF_B } as NodeJS.ProcessEnv);
@@ -170,7 +167,7 @@ describe("ensureKnowledgeSources", () => {
 
     const configB = makeConfig(SKILL_REF_B, HANDBOOK_SHA);
     const second = makeFetcher({ [`${SKILL_REF_B}/skills/code-review/SKILL.md`]: "# v2", [`${HANDBOOK_SHA}/docs/standards.md`]: "# Standards" });
-    const snapshot2 = await ensureKnowledgeSources(configB, fakeLogger, { cacheDir, fetcher: second, root: join(cacheDir, "..") });
+    const snapshot2 = await ensureKnowledgeSources(configB, fakeLogger, { cacheDir, fetcher: second });
     expect(snapshot2.skill.ref).toBe(SKILL_REF_B);
     expect(snapshot2.skill.files[0]!.sha256).toBe(sha256Hex("# v2"));
     // Old ref entry is untouched (immutable per-ref trees).
@@ -178,34 +175,53 @@ describe("ensureKnowledgeSources", () => {
 
     // Third run under ref B hits the cache.
     const third = makeFetcher({});
-    const snapshot3 = await ensureKnowledgeSources(configB, fakeLogger, { cacheDir, fetcher: third, root: join(cacheDir, "..") });
+    const snapshot3 = await ensureKnowledgeSources(configB, fakeLogger, { cacheDir, fetcher: third });
     expect(third.calls).toHaveLength(0);
     expect(snapshot3.skill.ref).toBe(SKILL_REF_B);
   });
 
-  test("oversized content → rejected → bundled fallback (skill) / unavailable (handbook)", async () => {
+  test("oversized content → rejected → unavailable (no fallback content)", async () => {
     const cacheDir = makeCacheDir();
     const fetcher = makeFetcher({
       [`${SKILL_REF}/skills/code-review/SKILL.md`]: "x".repeat(300_000), // > skill maxBytes
       [`${HANDBOOK_SHA}/docs/big.md`]: "y".repeat(3_000_000), // > handbook maxBytes
     }, { main: HANDBOOK_SHA });
-    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher, root: join(cacheDir, "..") });
-    expect(snapshot.skill.status).toBe("bundled");
-    expect(snapshot.skill.ref).toBe("bundled");
-    expect(snapshot.skill.files[0]!.sha256).toBe(sha256Hex(readFileSync(join(cacheDir, "..", "config/skills/code-review.md"), "utf8")));
+    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher });
+    expect(snapshot.skill.status).toBe("unavailable");
+    expect(snapshot.skill.dir).toBeNull();
+    expect(snapshot.skill.files).toEqual([]);
     expect(snapshot.handbook.status).toBe("unavailable");
     expect(snapshot.handbook.dir).toBeNull();
     expect(snapshot.handbook.files).toEqual([]);
   });
 
-  test("fetch failure (network down) → bundled fallback / unavailable, worker must not crash", async () => {
+  test("fetch failure (network down) → unavailable, worker must not crash", async () => {
     const cacheDir = makeCacheDir();
     const failing: KnowledgeFetcher = async () => {
       throw new Error("network down");
     };
-    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher: failing, root: join(cacheDir, "..") });
-    expect(snapshot.skill.status).toBe("bundled");
+    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher: failing });
+    expect(snapshot.skill.status).toBe("unavailable");
     expect(snapshot.handbook.status).toBe("unavailable");
+  });
+
+  test("unavailable skill source → skill reviews fail fast, never fall back to a local playbook", async () => {
+    const cacheDir = makeCacheDir();
+    const failing: KnowledgeFetcher = async () => {
+      throw new Error("network down");
+    };
+    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher: failing });
+    expect(snapshot.skill.status).toBe("unavailable");
+    await expect(
+      resolveReviewInjection({
+        reviewType: "skill",
+        config: makeConfig(),
+        changedFiles: [],
+        knowledgeDir: join(cacheDir, "knowledge"),
+        snapshot,
+        logger: fakeLogger,
+      }),
+    ).rejects.toMatchObject({ code: "skill_playbook_unavailable" });
   });
 
   test("concurrent ensure calls resolve once (shared initialization)", async () => {
@@ -213,10 +229,10 @@ describe("ensureKnowledgeSources", () => {
     const fetcher1 = makeFetcher({ [`${SKILL_REF}/skills/code-review/SKILL.md`]: "# concurrent", [`${HANDBOOK_SHA}/docs/standards.md`]: "# Standards" });
     const fetcher2 = makeFetcher({ [`${SKILL_REF}/skills/code-review/SKILL.md`]: "# concurrent" });
     const [a, b] = await Promise.all([
-      ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher: fetcher1, root: join(cacheDir, "..") }),
+      ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher: fetcher1 }),
       // Same cache dir → shares the first caller's initialization; the second
       // fetcher instance must never be called.
-      ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher: fetcher2, root: join(cacheDir, "..") }),
+      ensureKnowledgeSources(makeConfig(SKILL_REF, HANDBOOK_SHA), fakeLogger, { cacheDir, fetcher: fetcher2 }),
     ]);
     expect(a.skill.ref).toBe(SKILL_REF);
     expect(b.skill.ref).toBe(SKILL_REF);
@@ -251,7 +267,7 @@ describe("per-review knowledge snapshot (§4)", () => {
       [`${SKILL_REF}/skills/code-review/SKILL.md`]: "# skill\n\nPlaybook body.",
       [`${HANDBOOK_SHA}/docs/standards.md`]: "# Standards\n\nBe excellent to each other.",
     }, { main: HANDBOOK_SHA });
-    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher, root: join(cacheDir, "..") });
+    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher });
     setKnowledgeSnapshot(snapshot);
 
     const pr = await prisma.pullRequest.create({
@@ -310,7 +326,6 @@ describe("per-review knowledge snapshot (§4)", () => {
       knowledgeDir: result.knowledgeDir,
       snapshot,
       logger: fakeLogger,
-      root: join(cacheDir, ".."),
     });
     expect(injection!.text).toContain("Playbook body.");
     expect(injection!.files).toEqual(["skills/code-review/SKILL.md"]);
@@ -321,7 +336,7 @@ describe("per-review knowledge snapshot (§4)", () => {
     // Boot snapshot with a DIFFERENT ref/hash than the persisted one.
     const cacheDir = makeCacheDir();
     const fetcher = makeFetcher({ [`${SKILL_REF}/skills/code-review/SKILL.md`]: "# skill" });
-    const current = await ensureKnowledgeSources(makeConfig(SKILL_REF), fakeLogger, { cacheDir, fetcher, root: join(cacheDir, "..") });
+    const current = await ensureKnowledgeSources(makeConfig(SKILL_REF), fakeLogger, { cacheDir, fetcher });
     const staleSnapshot = JSON.parse(JSON.stringify(current)) as typeof current;
     staleSnapshot.skill.ref = "e".repeat(40);
     staleSnapshot.skill.contentHash = "deadbeef";
@@ -346,7 +361,7 @@ describe("per-review knowledge snapshot (§4)", () => {
       [`${SKILL_REF}/skills/code-review/SKILL.md`]: "# skill",
       [`${HANDBOOK_SHA}/docs/standards.md`]: handbookText,
     }, { main: HANDBOOK_SHA });
-    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher, root: join(cacheDir, "..") });
+    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher });
 
     expect(selectHandbookSections(handbookText, ["src/index.test.ts"], 5000)).toContain("Always test your changes.");
 
@@ -389,7 +404,7 @@ describe("per-review knowledge snapshot (§4)", () => {
   test("unavailable handbook snapshot fails fast with HANDBOOK_UNAVAILABLE", async () => {
     const cacheDir = makeCacheDir();
     const fetcher = makeFetcher({}, { main: HANDBOOK_SHA }); // no handbook files → unavailable
-    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher, root: join(cacheDir, "..") });
+    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher });
     expect(snapshot.handbook.status).toBe("unavailable");
     await expect(
       resolveReviewInjection({
@@ -410,7 +425,7 @@ describe("per-review knowledge snapshot (§4)", () => {
       [`${SKILL_REF}/skills/code-review/SKILL.md`]: "# skill",
       [`${HANDBOOK_SHA}/docs/standards.md`]: handbookText,
     }, { main: HANDBOOK_SHA });
-    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher, root: join(cacheDir, "..") });
+    const snapshot = await ensureKnowledgeSources(makeConfig(), fakeLogger, { cacheDir, fetcher });
 
     const workspacePath = mkdtempSync(join(tmpdir(), "ws-handbook-metrics-"));
     tempDirs.push(workspacePath);

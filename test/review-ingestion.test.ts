@@ -496,7 +496,7 @@ describe("review ingestion", () => {
       ...((disabled as { review: Record<string, unknown> }).review as Record<string, unknown>),
       types: {
         ...((((disabled as { review: Record<string, unknown> }).review as Record<string, unknown>).types ?? {}) as Record<string, unknown>),
-        skill: { enabled: false, publish: false, playbookPath: "config/skills/code-review.md" },
+        skill: { enabled: false, publish: false },
       },
     };
     const configPath = path.join(dir, "review.json");

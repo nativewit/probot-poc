@@ -85,8 +85,7 @@
       },
       "skill": {
         "enabled": true,
-        "publish": true,
-        "playbookPath": "config/skills/code-review.md"
+        "publish": true
       },
       "handbook": {
         "enabled": true,
@@ -174,7 +173,6 @@
       "repo": "vercel-labs/open-agents",
       "ref": "cf865e94de7729751c747171785b6ce57e7b178c",
       "skillDir": ".agents/skills/code-review",
-      "bundledFallback": "config/skills/code-review.md",
       "maxBytes": 200000,
       "maxTokens": 1500
     },

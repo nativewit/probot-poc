@@ -10,18 +10,17 @@
  * Cache layout (under the configured cacheDir):
  *
  *   skill/<commit-sha>/manifest.json + content files
- *   skill/bundled/manifest.json + bundled fallback copy (fetch failure)
  *   handbook/<commit-sha>/manifest.json + content files
  *
  * Each manifest.json stores { ref, fetchedAt, contentHash, files, status }.
  * A cached copy is reused (no network) when the manifest validates and every
  * file's sha256 matches.
  *
- * Failure semantics: on network/validation failure the worker NEVER crashes.
- * The skill falls back to the bundled copy (status "bundled"); the handbook
- * has no bundled copy and becomes "unavailable", failing handbook reviews
- * fast (HANDBOOK_UNAVAILABLE / HANDBOOK_UNCONFIGURED). Standard reviews are
- * unaffected.
+ * Failure semantics: there is no fallback content. On network/validation
+ * failure the source becomes "unavailable" and the worker NEVER crashes, so
+ * standard reviews are unaffected — but a review whose type needs the missing
+ * source fails fast (SKILL_PLAYBOOK_UNAVAILABLE / HANDBOOK_UNAVAILABLE /
+ * HANDBOOK_UNCONFIGURED).
  *
  * Security: fetched content is UNTRUSTED DATA injected into prompts — never
  * code, never configuration. Path traversal is rejected (no absolute paths,
@@ -79,8 +78,6 @@ export interface KnowledgeSourceSpec {
   /** Repo-relative directory or file prefix; "" = repo root recursively. */
   path: string;
   maxBytes: number;
-  /** Bundled fallback path (skill only). */
-  bundledFallback?: string;
   /** Resolved env override for the ref (KNOWLEDGE_SKILL_REF / KNOWLEDGE_HANDBOOK_REF). */
   refOverride?: string;
 }
@@ -89,15 +86,13 @@ export interface EnsureKnowledgeOptions {
   /** Resolved cache directory (worker resolves the workspace-relative default). */
   cacheDir?: string;
   fetcher?: KnowledgeFetcher;
-  /** Root used to resolve the bundled skill fallback path (defaults to cwd). */
-  root?: string;
 }
 
 export interface KnowledgeManifest {
   ref: string;
   fetchedAt: string;
   contentHash: string;
-  status: "fresh" | "bundled";
+  status: "fresh";
   files: KnowledgeFileRecord[];
 }
 
@@ -250,7 +245,6 @@ async function writeCacheEntry(
   cacheDir: string,
   kind: "skill" | "handbook",
   ref: string,
-  status: "fresh" | "bundled",
   files: KnowledgeFileRecord[],
   contents: Map<string, string>,
 ): Promise<{ dir: string; manifest: KnowledgeManifest }> {
@@ -272,7 +266,7 @@ async function writeCacheEntry(
       ref,
       fetchedAt: new Date().toISOString(),
       contentHash: computeContentHash(files),
-      status,
+      status: "fresh",
       files,
     };
     await fsp.writeFile(path.join(tempDir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
@@ -329,56 +323,17 @@ async function readCachedEntry(cacheDir: string, kind: "skill" | "handbook", ref
 // Per-source ensure
 // ---------------------------------------------------------------------------
 
-/** Bundled skill fallback: copy the shipped playbook into the cache. */
-async function ensureBundledSkill(
-  cacheDir: string,
-  bundledFallback: string,
-  root: string,
-  logger: pino.Logger,
-): Promise<KnowledgeSourceSnapshot> {
-  const bundledPath = path.resolve(root, bundledFallback);
-  try {
-    const text = await fsp.readFile(bundledPath, "utf8");
-    if (text.trim().length === 0) throw new Error("bundled playbook is empty");
-    const record: KnowledgeFileRecord = {
-      path: path.posix.basename(bundledFallback),
-      sha256: sha256Hex(text),
-      bytes: Buffer.byteLength(text, "utf8"),
-    };
-    const { dir, manifest } = await writeCacheEntry(
-      cacheDir,
-      "skill",
-      "bundled",
-      "bundled",
-      [record],
-      new Map([[record.path, text]]),
-    );
-    logger.warn(
-      { bundledFallback, contentHash: manifest.contentHash },
-      "Knowledge source 'skill': fetch failed; using bundled fallback",
-    );
-    return toSnapshot("bundled", manifest.ref, manifest.contentHash, dir, manifest.files);
-  } catch (error) {
-    logger.error(
-      { err: error instanceof Error ? error.message : String(error), bundledFallback },
-      "Knowledge source 'skill' unavailable: fetch failed and the bundled fallback could not be loaded",
-    );
-    return toSnapshot("unavailable", "bundled", null, null, []);
-  }
-}
-
 async function ensureSource(
   cacheDir: string,
   spec: KnowledgeSourceSpec,
   fetcher: KnowledgeFetcher,
   timeoutMs: number,
   logger: pino.Logger,
-  root: string,
 ): Promise<KnowledgeSourceSnapshot> {
   const requestedRef = ((spec.refOverride ?? "").trim() || spec.ref).toLowerCase();
 
   // 1. Valid cached copy for the requested ref → reuse, no network.
-  if (/^[0-9a-f]{40}$/.test(requestedRef) || requestedRef === "bundled") {
+  if (/^[0-9a-f]{40}$/.test(requestedRef)) {
     const cached = await readCachedEntry(cacheDir, spec.kind, requestedRef);
     if (cached) {
       logger.info(
@@ -400,7 +355,6 @@ async function ensureSource(
       cacheDir,
       spec.kind,
       fetched.ref,
-      "fresh",
       fetched.files,
       fetched.contents,
     );
@@ -414,11 +368,8 @@ async function ensureSource(
       { source: spec.kind, err: error instanceof Error ? error.message : String(error) },
       "Knowledge source fetch failed",
     );
-    // 3. Fallback: skill → bundled copy (worker never crashes); handbook →
-    //    unavailable (handbook reviews fail fast; standard reviews unaffected).
-    if (spec.kind === "skill") {
-      return ensureBundledSkill(cacheDir, spec.bundledFallback ?? "config/skills/code-review.md", root, logger);
-    }
+    // 3. No fallback content: the source is unavailable, and any review type
+    //    that needs it fails fast in injection. Standard reviews unaffected.
     return toSnapshot("unavailable", requestedRef, null, null, []);
   }
 }
@@ -441,8 +392,6 @@ export interface EnsureKnowledgeOptions {
   /** Resolved cache directory (worker resolves the workspace-relative default). */
   cacheDir?: string;
   fetcher?: KnowledgeFetcher;
-  /** Root used to resolve the bundled skill fallback path (defaults to cwd). */
-  root?: string;
 }
 
 /** Build the per-source specs from the (validated) review configuration. */
@@ -462,7 +411,6 @@ export function knowledgeSpecsFromConfig(config: ReviewConfig, env: NodeJS.Proce
       ref: knowledge.skill.ref,
       path: knowledge.skill.skillDir,
       maxBytes: knowledge.skill.maxBytes,
-      bundledFallback: knowledge.skill.bundledFallback,
       refOverride: env.KNOWLEDGE_SKILL_REF,
     },
     handbook: {
@@ -482,8 +430,8 @@ let inflightKey = "";
 /**
  * Initialize the knowledge sources once per worker boot. Idempotent and
  * concurrency-safe: concurrent calls for the same cache directory share one
- * initialization promise. Every failure path degrades gracefully (bundled
- * skill / unavailable handbook) — this function NEVER rejects.
+ * initialization promise. A failed source degrades to "unavailable" (there
+ * is no fallback content) — this function NEVER rejects.
  */
 export async function ensureKnowledgeSources(
   config: ReviewConfig,
@@ -506,10 +454,9 @@ export async function ensureKnowledgeSources(
   const run = (async (): Promise<KnowledgeSnapshot> => {
     await fsp.mkdir(cacheDir, { recursive: true });
     const fetcher = retryingFetcher(options.fetcher ?? createDefaultKnowledgeFetcher());
-    const root = options.root ?? process.cwd();
     const [skill, handbook] = await Promise.all([
-      ensureSource(cacheDir, specs.skill, fetcher, specs.timeoutMs, logger, root),
-      ensureSource(cacheDir, specs.handbook, fetcher, specs.timeoutMs, logger, root),
+      ensureSource(cacheDir, specs.skill, fetcher, specs.timeoutMs, logger),
+      ensureSource(cacheDir, specs.handbook, fetcher, specs.timeoutMs, logger),
     ]);
     return { cacheDir, skill, handbook };
   })();

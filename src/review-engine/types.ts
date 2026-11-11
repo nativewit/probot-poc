@@ -232,9 +232,9 @@ export interface PromptInjection {
   laterStagesText?: string;
   /** Snapshot-relative paths of the knowledge files that were used. */
   files: string[];
-  /** Content hash of the injected knowledge (null for the bundled fallback). */
+  /** Content hash of the injected knowledge snapshot. */
   contentHash: string | null;
-  /** Retrieval/selection funnel metrics (null for the bundled fallback). */
+  /** Retrieval/selection funnel metrics. */
   metrics?: KnowledgeInjectionMetrics | null;
 }
 

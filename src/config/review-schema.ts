@@ -85,8 +85,8 @@ const categoriesSchema = z
  * Review types (ARCHITECTURE.md §4.1): on-demand review methodologies that
  * can be compared against the same PR/head SHA.
  * - `standard` — the existing adaptive engine and instructions (the default).
- * - `skill` — same engine, plus a code-review playbook injected into the
- *   review instructions (config/skills/code-review.md by default).
+ * - `skill` — same engine, plus the code-review playbook fetched into the
+ *   boot-time knowledge cache and injected into the review instructions.
  * - `handbook` — same engine, plus relevant standards/conventions injected
  *   from the boot-time knowledge cache (see the `knowledge` section below);
  *   per review the content is pinned via the Review.knowledgeSnapshot.
@@ -106,8 +106,6 @@ const reviewTypesSchema = z.object({
     .object({
       enabled: z.boolean().default(true),
       publish: z.boolean().default(false),
-      /** Repository-relative path of the playbook markdown file. */
-      playbookPath: z.string().min(1).max(500).default("config/skills/code-review.md"),
     })
     .prefault({}),
   handbook: z
@@ -347,8 +345,6 @@ const knowledgeSchema = z.object({
       ref: z.string().min(1).max(200).default("cf865e94de7729751c747171785b6ce57e7b178c"),
       /** Directory inside the repo holding the skill markdown. */
       skillDir: z.string().max(500).default(".agents/skills/code-review"),
-      /** Bundled fallback used when the fetch fails (worker never crashes). */
-      bundledFallback: z.string().max(500).default("config/skills/code-review.md"),
       /** Total byte budget for the fetched skill content. */
       maxBytes: nonNegativeInt.max(10_000_000).default(200_000),
       /**

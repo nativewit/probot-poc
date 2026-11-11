@@ -8,8 +8,8 @@
  * workspace copy (§10 security invariant).
  */
 
-/** status "fresh": fetched from GitHub; "bundled": shipped fallback copy; "unavailable": no content. */
-export type KnowledgeSourceStatus = "fresh" | "bundled" | "unavailable";
+/** status "fresh": fetched from GitHub; "unavailable": no content (there is no fallback). */
+export type KnowledgeSourceStatus = "fresh" | "unavailable";
 
 /** One cached knowledge file. Paths are cache-relative and pre-validated. */
 export interface KnowledgeFileRecord {
@@ -21,7 +21,7 @@ export interface KnowledgeFileRecord {
 /** Resolved state of one knowledge source for this worker boot. */
 export interface KnowledgeSourceSnapshot {
   status: KnowledgeSourceStatus;
-  /** Pinned commit SHA (skill) or resolved commit SHA / "bundled" (handbook). */
+  /** Pinned or resolved commit SHA (empty when unavailable). */
   ref: string;
   /** sha256 over the sorted per-file hashes ("path sha256\n" lines); null when unavailable. */
   contentHash: string | null;

@@ -156,7 +156,6 @@ export const PANEL_FIELDS: Record<PanelSection, readonly PanelField[]> = {
     { path: "review.types.standard.publish", label: "Review type: standard publish to GitHub", type: "boolean" },
     { path: "review.types.skill.enabled", label: "Review type: skill enabled", type: "boolean" },
     { path: "review.types.skill.publish", label: "Review type: skill publish to GitHub", type: "boolean" },
-    { path: "review.types.skill.playbookPath", label: "Skill playbook path", type: "text" },
     { path: "review.types.handbook.enabled", label: "Review type: handbook enabled", type: "boolean" },
     { path: "review.types.handbook.publish", label: "Review type: handbook publish to GitHub", type: "boolean" },
     { path: "review.types.handbook.repository", label: "Handbook repository (owner/repo)", type: "text" },

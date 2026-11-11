@@ -7,13 +7,11 @@
  * instructions, composed with the trusted instruction profiles in
  * `src/review-engine/prompts/`:
  *
- * - `skill`   — a code-review playbook. The primary source is the review's
- *               OWN knowledge snapshot copy (knowledge/skill/ inside the
- *               review workspace, materialized at pipeline start from the
- *               boot-time cache). Without a snapshot (degraded boot / tests)
- *               the bundled config/skills/code-review.md file is used.
- *               Fail-fast with SKILL_PLAYBOOK_UNAVAILABLE when neither
- *               exists.
+ * - `skill`   — a code-review playbook, taken ONLY from the review's own
+ *               knowledge snapshot copy (knowledge/skill/ inside the review
+ *               workspace, materialized at pipeline start from the boot-time
+ *               cache). There is no local fallback: without a played-back
+ *               snapshot the review fails with SKILL_PLAYBOOK_UNAVAILABLE.
  * - `handbook`— relevant standards/conventions selected from the review's
  *               own knowledge snapshot copy (knowledge/handbook/) by the
  *               TRUSTED RETRIEVAL LAYER (retrieval.ts — Option A: the agent
@@ -39,7 +37,6 @@ import type pino from "pino";
 import type { ReviewConfig } from "../config/review-schema.js";
 import { ReviewEngineError, type PromptInjection, type KnowledgeInjectionMetrics } from "./types.js";
 import type { KnowledgeSnapshot } from "../knowledge/types.js";
-import { redactCredentials } from "../workspace/redact.js";
 import {
   CHARS_PER_TOKEN,
   rankHandbookFiles,
@@ -85,42 +82,6 @@ function enforceTokenBudget(text: string, maxTokens: number): { text: string; tr
 // Skill playbook
 // ---------------------------------------------------------------------------
 
-/** Bundled fallback (legacy/dev path): read the configured playbook file. */
-export function loadSkillPlaybook(config: ReviewConfig, root = process.cwd()): PromptInjection {
-  const playbookPath = config.review.types.skill.playbookPath;
-  const resolved = path.resolve(root, playbookPath);
-  let text: string;
-  try {
-    text = fs.readFileSync(resolved, "utf8");
-  } catch (error) {
-    throw new ReviewEngineError(
-      "skill_playbook_unavailable",
-      `Review type 'skill' requires the playbook at '${playbookPath}' (${redactCredentials(
-        (error as Error).message,
-      )})`,
-    );
-  }
-  if (text.trim().length === 0) {
-    throw new ReviewEngineError("skill_playbook_unavailable", `Playbook '${playbookPath}' is empty`);
-  }
-  const budgeted = enforceTokenBudget(text, config.knowledge.skill.maxTokens);
-  return {
-    label: "code-review playbook",
-    profile: "skill",
-    text: budgeted.text,
-    files: [playbookPath],
-    contentHash: null,
-    metrics: {
-      injectedTokens: estimateTokens(budgeted.text),
-      documentsRetrieved: 1,
-      candidates: 1,
-      relevant: 1,
-      selected: 1,
-      truncated: budgeted.truncated,
-    },
-  };
-}
-
 /**
  * Skill injection from the review's own snapshot copy: prefer the skill's
  * main SKILL.md; otherwise concatenate the .md/.txt files deterministically
@@ -131,20 +92,14 @@ async function injectSkillFromSnapshot(
   knowledgeDir: string,
   snapshot: KnowledgeSnapshot,
   config: ReviewConfig,
-  root: string,
 ): Promise<PromptInjection> {
   const source = snapshot.skill;
   if (source.status === "unavailable" || !source.dir) {
-    // Cache degraded after boot (e.g. manual wipe): fall back to the bundled
-    // playbook when it still exists, otherwise fail fast.
-    try {
-      return loadSkillPlaybook(config, root);
-    } catch {
-      throw new ReviewEngineError(
-        "skill_playbook_unavailable",
-        "Review type 'skill' requires the code-review playbook, which is unavailable in the knowledge cache",
-      );
-    }
+    // No fallback content: the playbook must come from the fetched source.
+    throw new ReviewEngineError(
+      "skill_playbook_unavailable",
+      "Review type 'skill' requires the code-review playbook, which is unavailable in the knowledge cache",
+    );
   }
   const dir = path.join(knowledgeDir, "skill");
   const files = await listMarkdownFiles(dir);
@@ -202,7 +157,7 @@ function headingTokens(heading: string): string[] {
 
 /**
  * Legacy single-document section selection (kept for compatibility and as
- * the bundled-fallback path): split markdown text into sections on markdown
+ * the playbook path): split markdown text into sections on markdown
  * headings and score each section by keyword overlap with the changed file
  * paths. Sections with zero overlap are dropped; if nothing overlaps, the
  * first sections win so general standards still reach the prompt.
@@ -349,10 +304,13 @@ async function injectHandbookFromSnapshot(
 export async function resolveReviewInjection(input: ResolveInjectionInput): Promise<PromptInjection | null> {
   const { reviewType, config, logger } = input;
   if (reviewType === "skill") {
-    const injection =
-      input.knowledgeDir && input.snapshot
-        ? await injectSkillFromSnapshot(input.knowledgeDir, input.snapshot, config, input.root ?? process.cwd())
-        : loadSkillPlaybook(config, input.root ?? process.cwd());
+    if (!input.knowledgeDir || !input.snapshot) {
+      throw new ReviewEngineError(
+        "skill_playbook_unavailable",
+        "No knowledge snapshot was materialized for this review (boot-time knowledge init did not run)",
+      );
+    }
+    const injection = await injectSkillFromSnapshot(input.knowledgeDir, input.snapshot, config);
     logger.info(
       { files: injection.files, contentHash: injection.contentHash, metrics: injection.metrics },
       "Skill playbook injected into review instructions",
@@ -387,6 +345,4 @@ export interface ResolveInjectionInput {
   /** Boot-time knowledge snapshot (null when knowledge init never ran). */
   snapshot?: KnowledgeSnapshot | null;
   logger: pino.Logger;
-  /** Root used to resolve the bundled fallback playbook path (tests). */
-  root?: string;
 }

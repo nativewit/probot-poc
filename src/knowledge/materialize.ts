@@ -116,8 +116,8 @@ export async function materializeReviewKnowledge(
   if (kinds.length === 0) return { knowledgeDir: null, snapshot: input.snapshot };
 
   if (!input.snapshot) {
-    // Knowledge init never ran (e.g. tests / degraded boot): skill reviews
-    // fall back to the bundled playbook; handbook reviews fail in injection.
+    // Knowledge init never ran (e.g. tests / degraded boot): there is no
+    // fallback content, so skill and handbook reviews fail in injection.
     input.logger.warn({ reviewId: input.reviewId }, "No boot-time knowledge snapshot available");
     return { knowledgeDir: null, snapshot: null };
   }

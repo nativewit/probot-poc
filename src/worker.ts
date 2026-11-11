@@ -68,9 +68,9 @@ async function main(): Promise<void> {
   // Boot-time knowledge source initialization (§5.3): the code-review skill
   // playbook and the engineering handbook are fetched ONCE per worker boot
   // into the persistent knowledge cache — never per review. Bounded by a
-  // per-source fetch deadline; a total failure never crashes the worker
-  // (skill falls back to the bundled copy, handbook reviews fail fast, and
-  // standard reviews are unaffected).
+  // per-source fetch deadline; a failure never crashes the worker. There is
+  // no fallback content: the missing source is marked unavailable and reviews
+  // of the type that needs it fail fast; standard reviews are unaffected.
   // -------------------------------------------------------------------------
   try {
     const knowledgeCacheDir =

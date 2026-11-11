@@ -175,8 +175,9 @@ into a persistent cache (`KNOWLEDGE_CACHE_DIR`, default `<workspaces-root>/knowl
 `knowledge.skill.ref` / `knowledge.handbook.ref` in `config/review.json`; a branch
 name is resolved to its current commit SHA at boot). Optional bearer token:
 `KNOWLEDGE_GITHUB_TOKEN` (or `GITHUB_TOKEN`) for private handbook repos. If a fetch
-fails the worker still starts: the skill falls back to the bundled
-`config/skills/code-review.md`, handbook reviews fail fast. Each review persists the
+fails the worker still starts, but there is no fallback content: the source is marked
+unavailable and skill/handbook reviews fail fast (`SKILL_PLAYBOOK_UNAVAILABLE` /
+`HANDBOOK_UNAVAILABLE`). Each review persists the
 exact knowledge snapshot it started with (`Review.knowledgeSnapshot`) and injects
 from its own workspace copy, so cache refreshes never alter an in-flight review; the
 comparison endpoint reports the per-source ref + content hash plus the additive

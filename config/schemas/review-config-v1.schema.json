@@ -219,11 +219,6 @@
                 },
                 "publish": {
                   "type": "boolean"
-                },
-                "playbookPath": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 500
                 }
               }
             },
@@ -641,10 +636,6 @@
               "maxLength": 200
             },
             "skillDir": {
-              "type": "string",
-              "maxLength": 500
-            },
-            "bundledFallback": {
               "type": "string",
               "maxLength": 500
             },
