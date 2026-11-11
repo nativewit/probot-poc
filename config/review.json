@@ -85,12 +85,12 @@
       },
       "skill": {
         "enabled": true,
-        "publish": false,
+        "publish": true,
         "playbookPath": "config/skills/code-review.md"
       },
       "handbook": {
         "enabled": true,
-        "publish": false,
+        "publish": true,
         "repository": "",
         "branch": "main",
         "path": "",
