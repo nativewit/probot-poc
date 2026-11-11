@@ -27,7 +27,7 @@ import { getPrisma } from "../lib/prisma.js";
  *
  * Guards:
  * - only pull requests (the issues webhook fires for plain issues too);
- * - bot comments and closed PRs are ignored;
+ * - bot comments are ignored;
  * - the command must match `github.manualCommand` (default `/review`) and
  *   `github.events` must include `issue_comment`, with
  *   `review.triggers.manual` and `review.enabled` on;
@@ -120,12 +120,6 @@ export function registerIssueCommentHandlers(app: Probot): void {
       }
     }
     const reviewType: ReviewTypeValue = (requestedType as ReviewTypeValue | undefined) ?? config.github.defaultReviewType;
-
-    // Closed pull requests are not reviewed.
-    if (issue.state === "closed") {
-      context.log.info({ pr: issue.number, repo: repository.full_name }, "/review on closed pull request ignored");
-      return;
-    }
 
     // Resolve base/head SHAs: durable row first (fresh from open/synchronize),
     // then the GitHub API as a fallback for PRs this app has never seen. The

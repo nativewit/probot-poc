@@ -515,7 +515,7 @@ describe("review ingestion", () => {
     }
   });
 
-  test("non-command comments, bot comments and closed PRs are ignored", async () => {
+  test("non-command comments and bot comments are ignored", async () => {
     await receiveDelivery(probot, "pull_request", "opened", pullRequestPayload("opened"), "delivery-cmd-open-3");
     const before = await prisma.review.count();
 
@@ -528,13 +528,6 @@ describe("review ingestion", () => {
       commentPayload("/review", { comment: { user: { type: "Bot", login: "ai-pr-reviewer[bot]" } } }),
       "delivery-cmd-6",
     );
-    await receiveDelivery(
-      probot,
-      "issue_comment",
-      "created",
-      commentPayload("/review", { issue: { state: "closed" } }),
-      "delivery-cmd-7",
-    );
     // Plain issues (no pull_request marker) are ignored too.
     await receiveDelivery(
       probot,
@@ -545,6 +538,21 @@ describe("review ingestion", () => {
     );
 
     expect(await prisma.review.count()).toBe(before);
+  });
+
+  test("/review on a closed pull request is ingested", async () => {
+    await receiveDelivery(probot, "pull_request", "opened", pullRequestPayload("opened"), "delivery-cmd-open-closed-1");
+    const before = await prisma.review.count();
+
+    await receiveDelivery(
+      probot,
+      "issue_comment",
+      "created",
+      commentPayload("/review", { issue: { state: "closed" } }),
+      "delivery-cmd-7",
+    );
+
+    expect(await prisma.review.count()).toBe(before + 1);
   });
 
   test("installation.created registers installation + repositories; installation.deleted disables them", async () => {
